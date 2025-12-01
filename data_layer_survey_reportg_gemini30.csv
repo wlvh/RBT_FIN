@@ -1,0 +1,14 @@
+Category,Data Name,Endpoint,Params/Notes,Earliest Date,Sample Size,Missing Ratio (Initial 300d),Status
+Macro (Global),Dollar Index (DXY),https://query2.finance.yahoo.com/v8/finance/chart/,"Ticker: DX-Y.NYB, Interval: 1d (High missing ratio due to Weekends/Holidays)",1971-01-04,300 Days,31.00%,Active
+Macro (Global),S&P 500,https://query2.finance.yahoo.com/v8/finance/chart/,"Ticker: ^GSPC, Interval: 1d (High missing ratio due to Weekends/Holidays)",1927-12-30,300 Days,31.33%,Active
+Macro (Global),US 10Y Treasury,https://query2.finance.yahoo.com/v8/finance/chart/,"Ticker: ^TNX, Interval: 1d (High missing ratio due to Weekends/Holidays)",1962-01-02,300 Days,31.00%,Active
+Macro (Global),Volatility Index (VIX),https://query2.finance.yahoo.com/v8/finance/chart/,"Ticker: ^VIX, Interval: 1d (High missing ratio due to Weekends/Holidays)",1990-01-02,300 Days,30.33%,Active
+Macro (Global),Gold Futures,https://query2.finance.yahoo.com/v8/finance/chart/,"Ticker: GC=F, Interval: 1d (High missing ratio due to Weekends/Holidays)",2000-08-30,300 Days,31.67%,Active
+On-Chain (Fundamental),Hash Rate,https://api.blockchain.info/charts/hash-rate,"timespan=all, format=json",2009-01-03,300 Days,75.00%,Active
+On-Chain (Fundamental),Mining Difficulty,https://api.blockchain.info/charts/difficulty,"timespan=all, format=json",2009-01-03,300 Days,75.00%,Active
+On-Chain (Fundamental),Mempool Size,https://api.blockchain.info/charts/mempool-size,"timespan=all, format=json",2016-06-14,300 Days,56.33%,Active
+Sentiment,Fear & Greed Index,https://api.alternative.me/fng/,limit=0 (All History),2018-02-01,300 Days,1.00%,Active
+Liquidity,Total Stablecoin Market Cap,https://stablecoins.llama.fi/stablecoincharts/all,N/A,2017-11-29,300 Days,0.00%,Active
+On-Chain (Advanced),Exchange Flows (Spot),CryptoQuant/Glassnode API,TODO: Paid Plan Required,TODO (Paid),0,N/A,TODO
+On-Chain (Advanced),Whale Wallet Balance,Glassnode API,TODO: Tier 2 API Required,TODO (Paid),0,N/A,TODO
+Derivatives,Option Gamma Exposure,Amberdata/Deribit API,TODO: Paid API Required,TODO (Paid),0,N/A,TODO
