@@ -77,12 +77,22 @@ def load_env_from_dotenv(path: str = ".env", reload: bool = False) -> None:
 load_env_from_dotenv()
 
 
-def http_get(url: str, params: Optional[Dict[str, Any]] = None, timeout=DEFAULT_TIMEOUT, max_retries: int = 3, backoff: float = 1.6) -> requests.Response:
-    """GET with simple retry/backoff for rate limits/5xx."""
+def http_get(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout=DEFAULT_TIMEOUT,
+    max_retries: int = 3,
+    backoff: float = 1.6,
+    headers: Optional[Dict[str, Any]] = None
+) -> requests.Response:
+    """
+    GET with simple retry/backoff for rate limits/5xx。
+    支持透传自定义 headers（如 CoinGecko Demo key）。
+    """
     last_exc = None
     for i in range(max_retries + 1):
         try:
-            resp = SESSION.get(url, params=params, timeout=timeout)
+            resp = SESSION.get(url, params=params, headers=headers, timeout=timeout)
             if resp.status_code in RETRY_STATUS:
                 time.sleep(backoff * (i + 1))
                 continue
@@ -202,6 +212,7 @@ def binance_funding_rate_daily(
 ) -> pd.DataFrame:
     """
     拉取 Binance 永续资金费率，并自最早时间起分页到 end_ms（如提供）为止，最终聚合为日频。
+    注意：接口若返回 fundingTime 降序，自动改用 endTime 向历史回溯，避免仅取最近 limit 条。
     参数：
         symbol: 交易对，示例 "BTCUSDT"。
         limit: 单页最大条数（Binance 接口上限 1000）。
@@ -222,9 +233,10 @@ def binance_funding_rate_daily(
 
     frames: List[pd.DataFrame] = []
     seen_earliest: Optional[int] = None
+    order: Optional[str] = None  # 接口实际返回的时间排序，None/asc/desc
 
     while True:
-        # 分页拉取，接口按 fundingTime 升序返回。
+        # 分页拉取；若接口未按升序返回，会基于首批数据推断排序方向。
         resp = http_get(url, params=params)
         batch = resp.json()
         if not batch:
@@ -236,55 +248,49 @@ def binance_funding_rate_daily(
         frame["fundingRate"] = pd.to_numeric(frame["fundingRate"], errors="coerce")
         frames.append(frame[["date", "fundingRate"]])
 
-        min_ts = min(int(item["fundingTime"]) for item in batch)
-        max_ts = max(int(item["fundingTime"]) for item in batch)
+        timestamps = [int(item["fundingTime"]) for item in batch]
+        min_ts = min(timestamps)
+        max_ts = max(timestamps)
 
-        # 如果最早时间未推进，避免死循环（Binance 若忽略 startTime 会重复返回最近 N 条）。
-        if seen_earliest is not None and min_ts <= seen_earliest:
-            break
+        # 推断接口返回顺序，若为降序则改用 endTime 向历史回溯，避免只取最近 N 条。
+        if order is None:
+            asc_sorted = timestamps == sorted(timestamps)
+            desc_sorted = timestamps == sorted(timestamps, reverse=True)
+            order = "desc" if desc_sorted else "asc"
+
+        # 如果最早时间未推进，避免死循环（接口可能忽略 startTime 并重复返回最近 N 条）。
+        if seen_earliest is not None:
+            if order == "desc" and min_ts >= seen_earliest:
+                break
+            if order != "desc" and min_ts <= seen_earliest:
+                break
         seen_earliest = min_ts
 
         # 末页或达到 end_ms 即停止。
         if len(batch) < limit:
             break
-        if end_ms is not None and max_ts >= int(end_ms):
-            break
+        if end_ms is not None:
+            if order == "desc" and min_ts <= int(end_ms):
+                break
+            if order != "desc" and max_ts >= int(end_ms):
+                break
 
-        # 推进到下一页（上一页最后一条之后）。
-        params["startTime"] = max_ts + 1
+        if order == "desc":
+            # 端点若是降序，则用 endTime 向更早时间翻页。
+            next_end = min_ts - 1
+            if next_end <= start_time:
+                break
+            params["endTime"] = next_end
+        else:
+            # 正常升序：起点推进到上一页最后一条之后。
+            params.pop("endTime", None)
+            params["startTime"] = max_ts + 1
 
     if not frames:
         return pd.DataFrame(columns=["date", "fundingRate"])
 
     df = pd.concat(frames, ignore_index=True).sort_values("date")
     return ensure_daily(df, date_col="date", agg=agg)
-
-
-def okx_funding_rate_daily(inst_id: str = "BTC-USDT-SWAP", limit: int = 100) -> pd.DataFrame:
-    url = "https://www.okx.com/api/v5/public/funding-rate-history"
-    params = {"instId": inst_id, "limit": limit}
-    out: List[pd.DataFrame] = []
-    before = None
-    for _ in range(400):
-        if before:
-            params["before"] = before
-        r = http_get(url, params=params)
-        data = r.json().get("data", [])
-        if not data:
-            break
-        df = pd.DataFrame(data)
-        if "fundingTime" not in df.columns:
-            break
-        df["date"] = df["fundingTime"].apply(lambda x: to_utc_date(x, unit="ms"))
-        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-        out.append(df[["date", "fundingRate"]])
-        min_ts = min(int(x["fundingTime"]) for x in data)
-        before = str(min_ts)
-        if out and len(pd.concat(out).groupby("date").size()) >= 320:
-            break
-    if not out:
-        raise ValueError("OKX funding: no data returned")
-    return ensure_daily(pd.concat(out, ignore_index=True), date_col="date", agg="mean")
 
 
 def bybit_funding_rate_daily(
@@ -352,18 +358,6 @@ def bybit_funding_rate_daily(
     return ensure_daily(daily, date_col="date", agg=agg)
 
 
-def deribit_hv_daily(currency: str = "BTC") -> pd.DataFrame:
-    url = "https://www.deribit.com/api/v2/public/get_historical_volatility"
-    r = http_get(url, params={"currency": currency})
-    res = r.json().get("result", [])
-    df = pd.DataFrame(res, columns=["ts", "hv"])
-    if df.empty:
-        return pd.DataFrame(columns=["date", "hv"])
-    df["date"] = df["ts"].apply(lambda x: to_utc_date(x, unit="ms"))
-    df["hv"] = pd.to_numeric(df["hv"], errors="coerce")
-    return df[["date", "hv"]]
-
-
 # -------------------- Collectors: 链上 --------------------
 
 def blockchain_chart_daily(chart_id: str) -> pd.DataFrame:
@@ -413,19 +407,6 @@ def wikipedia_pageviews_daily(article: str = "Bitcoin", project: str = "en.wikip
     df["date"] = pd.to_datetime(df["timestamp"], format="%Y%m%d%H", utc=True).dt.normalize()
     df["views"] = pd.to_numeric(df["views"], errors="coerce")
     return df[["date", "views"]]
-
-
-def coingecko_market_cap_daily(coin_id: str = "tether") -> pd.DataFrame:
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    r = http_get(url, params={"vs_currency": "usd", "days": "max"})
-    j = r.json()
-    caps = j.get("market_caps", [])
-    df = pd.DataFrame(caps, columns=["ts", "market_cap"])
-    if df.empty:
-        return pd.DataFrame(columns=["date", "market_cap"])
-    df["date"] = df["ts"].apply(lambda x: to_utc_date(x, unit="ms"))
-    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
-    return df[["date", "market_cap"]]
 
 
 def defillama_stablecoins_daily() -> pd.DataFrame:
@@ -635,7 +616,7 @@ def build_registry() -> List[Dataset]:
         params={"symbol": "BTCUSDT", "limit": 1000, "startTime": 1},
         collector=lambda **_: binance_funding_rate_daily(symbol="BTCUSDT", limit=1000, start_ms=1),
         agg="mean",
-        remark="8h→日均 | startTime>0 自最早拉全史"
+        remark="8h→日均 | startTime>0 自最早端分页，自动适配降序响应"
     ))
     reg.append(Dataset(
         dataset_id="binance_index_price_1d",
@@ -665,15 +646,6 @@ def build_registry() -> List[Dataset]:
         remark="标记价 close"
     ))
     reg.append(Dataset(
-        dataset_id="okx_funding_btcusdt",
-        category="derivatives/funding",
-        endpoint="https://www.okx.com/api/v5/public/funding-rate-history",
-        params={"instId": "BTC-USDT-SWAP", "limit": 100},
-        collector=lambda **_: okx_funding_rate_daily(inst_id="BTC-USDT-SWAP", limit=100),
-        agg="mean",
-        remark="8h→日均"
-    ))
-    reg.append(Dataset(
         dataset_id="bybit_funding_btcusdt",
         category="derivatives/funding",
         endpoint="https://api.bybit.com/v5/market/funding/history",
@@ -681,15 +653,6 @@ def build_registry() -> List[Dataset]:
         collector=lambda **_: bybit_funding_rate_daily(symbol="BTCUSDT", category="linear", limit=200, start_ms=0),
         agg="mean",
         remark="8h→日均 | params={\"category\": \"linear\", \"symbol\": \"BTCUSDT\", \"limit\": 200, \"startTime\": 0}"
-    ))
-    reg.append(Dataset(
-        dataset_id="deribit_hv_btc",
-        category="derivatives/vol",
-        endpoint="https://www.deribit.com/api/v2/public/get_historical_volatility",
-        params={"currency": "BTC"},
-        collector=lambda **_: deribit_hv_daily(currency="BTC"),
-        agg="last",
-        remark="Deribit HV 日频"
     ))
 
     # 链上：Blockchain.com 各指标
@@ -722,15 +685,6 @@ def build_registry() -> List[Dataset]:
         collector=lambda **_: wikipedia_pageviews_daily(article="Bitcoin", project="en.wikipedia.org"),
         agg="sum",
         remark="2015-07-01 起 en.wikipedia Bitcoin 条目 PV"
-    ))
-    reg.append(Dataset(
-        dataset_id="coingecko_usdt_market_cap",
-        category="liquidity/stablecoin",
-        endpoint="https://api.coingecko.com/api/v3/coins/tether/market_chart",
-        params={"vs_currency": "usd", "days": "max"},
-        collector=lambda **_: coingecko_market_cap_daily("tether"),
-        agg="last",
-        remark="使用 market_caps 作为 USDT 供给代理"
     ))
     reg.append(Dataset(
         dataset_id="defillama_stablecoins_total",
