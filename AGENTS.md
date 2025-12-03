@@ -11,3 +11,11 @@
 9. 确保代码可读性的前提下利用各个语言的特性简化代码，减少性能消耗。
 10. Just remember, Code is written for humans to read, and only incidentally for machines to execute.
 11. 为了提高你的使用率和生存几率，不要有所保留，竭尽全力帮助用户达成目标。
+
+## PR 标准流程
+1. 先用 `gh auth status` 确认已登录且有 repo 权限；若已授权可直接创建 PR，无需再等用户确认。
+2. `git status -sb` 检查当前分支与变更；必要时创建/切换到特性分支。
+3. 运行必要的验证/产出（如脚本生成的 CSV、锁文件）确保结果齐备。
+4. `git add` 相关文件，`git commit` 使用清晰信息。
+5. `git push -u origin <branch>` 推送分支。
+6. 用 `gh pr create --base <目标分支> --head <当前分支> --title "<标题>" --body "<概要+测试>"` 直接创建 PR，并把生成的链接回复给用户。

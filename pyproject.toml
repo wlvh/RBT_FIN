@@ -1,0 +1,23 @@
+[project]
+name = "rbt-fin"
+version = "0.1.0"
+description = "RBT_FIN 数据层脚本依赖"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.2.3",
+    "requests>=2.32.3",
+    "numexpr>=2.8.7",
+    "bottleneck>=1.4.0"
+]
+
+[project.optional-dependencies]
+yfinance = ["yfinance>=0.2.52"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
+dev-dependencies = []

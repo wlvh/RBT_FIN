@@ -4,15 +4,23 @@
 
 ## 快速开始
 
-1. 安装依赖（仅用到 `pandas`、`requests`，如需 yfinance 自行安装）：  
+1. 推荐使用 uv 管理环境（自动创建/复用 `.venv`，解决 pandas 的 numexpr/bottleneck 版本告警）：  
    ```bash
-   pip install pandas requests
+   uv sync
+   # 使用 uv 管理的虚拟环境运行
+   uv run python data_layer_unified_opt.py --out datasets_unified_summary.csv --limit 300 --start-date 2021-01-01
+   # 如需 yfinance，安装可选依赖
+   uv sync --extra yfinance
+   ```
+   若不使用 uv，可手动安装核心依赖：  
+   ```bash
+   pip install pandas requests numexpr bottleneck
    ```
 2. 配置环境变量（示例已写入 `.env`，实际使用请填入自己的 key）：  
    ```
    FRED_API_KEY=你的key
    GLASSNODE_API_KEY=可选
-   CRYPTOCOMPARE_API_KEY=可选（内置免费 key 也可用）
+   CRYPTOCOMPARE_API_KEY=你的key（必填，勿写入代码）
    ```
    `.env` 已加入 `.gitignore`，不会提交。
 3. 生成数据概览：  
@@ -26,4 +34,4 @@
 - Binance/OKX/Bybit 资金费率等衍生品数据按日聚合；Binance/Bybit 从最早时间起分页抓取，避免缺口。  
 - 宏观数据改用 FRED（DXY/SPX/US10Y/VIX 等），黄金改用 Stooq `xauusd`，无需代理。  
 - `.env` 自动加载，无需在代码里硬编码 key。  
-- 早期链上数据（Blockchain.com）缺失较多，建模建议从 2020-01-01 之后使用。*** End Patch
+- 早期链上数据（Blockchain.com）缺失较多，建模建议从 2020-01-01 之后使用。
