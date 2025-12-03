@@ -12,6 +12,7 @@ Unified daily data layer
 
 用法示例：
     python data_layer_unified_opt.py --out datasets_unified_summary.csv --limit 300
+    python data_layer_unified_opt.py --start-date 2020-01-01
 """
 
 from __future__ import annotations
@@ -130,6 +131,22 @@ def to_utc_date(ts: Any, unit: str = "ms") -> pd.Timestamp:
     return pd.Timestamp(dt.date(), tz="UTC")
 
 
+def normalize_start_date(start: Optional[Any]) -> Optional[pd.Timestamp]:
+    """
+    将用户指定的开始日期解析为 UTC 零点日期。
+    参数：
+        start: 可以是字符串、时间戳或 pd.Timestamp，None 表示不限制。
+    返回：
+        规范化后的 UTC 日期；若未提供则返回 None，若解析失败则抛出 ValueError。
+    """
+    if start is None:
+        return None
+    ts = pd.to_datetime(arg=start, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"无效的开始日期: {start}")
+    return ts.normalize()
+
+
 def ensure_daily(df: pd.DataFrame, date_col: str = "date", agg: str = "mean") -> pd.DataFrame:
     """保证日频；子日频按 agg 聚合。"""
     if df is None or df.empty:
@@ -163,7 +180,30 @@ def sample_first_n_days(df: pd.DataFrame, n: int = 300, date_col: str = "date") 
     return cal.merge(df, on=date_col, how="left")
 
 
+def apply_start_date_filter(df: pd.DataFrame, start_date: Optional[pd.Timestamp], date_col: str = "date") -> pd.DataFrame:
+    """
+    按统一的起始日期裁剪数据集。
+    参数：
+        df: 待过滤的 DataFrame。
+        start_date: UTC 起始日期，若为 None 则不做裁剪。
+        date_col: 日期列名称，默认 "date"。
+    返回：
+        过滤后的 DataFrame；若 df 为空或缺少日期列则原样返回。
+    """
+    if df is None or df.empty or start_date is None or date_col not in df.columns:
+        return df
+    return df[df[date_col] >= start_date].copy()
+
+
 def na_cells_info(df: pd.DataFrame, date_col: str = "date") -> tuple[int, float]:
+    """
+    计算 DataFrame 中缺失值总量及比例。
+    参数：
+        df: 待评估的 DataFrame。
+        date_col: 日期列名称，默认 "date"（不计入缺失统计）。
+    返回：
+        (缺失单元格数量, 缺失率)。
+    """
     if df is None or df.empty:
         return 0, 0.0
     value_cols = [c for c in df.columns if c != date_col]
@@ -178,6 +218,7 @@ def na_cells_info(df: pd.DataFrame, date_col: str = "date") -> tuple[int, float]
 
 @dataclass
 class Dataset:
+    """数据集元信息，统一描述采集端点、参数与处理方式。"""
     dataset_id: str
     category: str
     endpoint: str
@@ -189,9 +230,32 @@ class Dataset:
 
 # -------------------- Collectors: 衍生品 --------------------
 
-def binance_kline_daily(endpoint: str, param_key: str, symbol: str, value_col: str, limit: int = 1500) -> pd.DataFrame:
+def binance_kline_daily(
+    endpoint: str,
+    param_key: str,
+    symbol: str,
+    value_col: str,
+    limit: int = 1500,
+    start_date: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
+    """
+    获取 Binance 永续/指数/溢价/标记价的日频 K 线。
+    参数：
+        endpoint: API 路径（不含域名）。
+        param_key: 交易对参数名（如 symbol/pair）。
+        symbol: 交易对。
+        value_col: 需要输出的列名，通常是 close。
+        limit: 单页条数上限。
+        start_date: 统一起始日期，若提供则转为毫秒传入 startTime。
+    返回：
+        含 date 与目标列的日频 DataFrame。
+    """
+    start_time_ms = 0
+    if start_date is not None:
+        start_ts = pd.to_datetime(arg=start_date, utc=True)
+        start_time_ms = max(int(start_ts.timestamp() * 1000), 0)
     url = f"https://fapi.binance.com{endpoint}"
-    params = {param_key: symbol, "interval": "1d", "limit": limit, "startTime": 0}
+    params = {param_key: symbol, "interval": "1d", "limit": limit, "startTime": start_time_ms}
     r = http_get(url, params=params)
     data = r.json()
     if not data:
@@ -200,7 +264,7 @@ def binance_kline_daily(endpoint: str, param_key: str, symbol: str, value_col: s
     df = pd.DataFrame(data, columns=cols[: len(data[0])])
     df["date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.normalize()
     df[value_col] = pd.to_numeric(df["close"], errors="coerce")
-    return df[["date", value_col]]
+    return apply_start_date_filter(df[["date", value_col]], start_date, date_col="date")
 
 
 def binance_funding_rate_daily(
@@ -208,7 +272,8 @@ def binance_funding_rate_daily(
     limit: int = 1000,
     start_ms: Optional[int] = 1,
     end_ms: Optional[int] = None,
-    agg: str = "mean"
+    agg: str = "mean",
+    start_date: Optional[pd.Timestamp] = None
 ) -> pd.DataFrame:
     """
     拉取 Binance 永续资金费率，并自最早时间起分页到 end_ms（如提供）为止，最终聚合为日频。
@@ -219,11 +284,17 @@ def binance_funding_rate_daily(
         start_ms: 起始毫秒时间戳，默认为 1，避免 startTime=0 被 Binance 视为未传参。
         end_ms: 结束毫秒时间戳，可选；不传则一直拉到最新。
         agg: 日内聚合方式，默认均值。
+        start_date: 统一起始日期（UTC），若提供则覆盖 start_ms。
     返回：
         包含 date、fundingRate 列的日频 DataFrame，date 为 UTC 日期。
     """
     url = "https://fapi.binance.com/fapi/v1/fundingRate"
     params: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+
+    # 统一起点优先；若提供 start_date 则覆盖 start_ms。
+    if start_date is not None:
+        start_ts = pd.to_datetime(arg=start_date, utc=True)
+        start_ms = int(start_ts.timestamp() * 1000)
 
     # Binance 将 startTime=0 视作缺省，因此将非正值提升为 1，确保从最早时间开始。
     start_time = 1 if start_ms is None or int(start_ms) <= 0 else int(start_ms)
@@ -290,7 +361,8 @@ def binance_funding_rate_daily(
         return pd.DataFrame(columns=["date", "fundingRate"])
 
     df = pd.concat(frames, ignore_index=True).sort_values("date")
-    return ensure_daily(df, date_col="date", agg=agg)
+    filtered = apply_start_date_filter(df, start_date, date_col="date")
+    return ensure_daily(filtered, date_col="date", agg=agg)
 
 
 def bybit_funding_rate_daily(
@@ -298,7 +370,8 @@ def bybit_funding_rate_daily(
     category: str = "linear",
     limit: int = 200,
     start_ms: Optional[int] = 0,
-    agg: str = "mean"
+    agg: str = "mean",
+    start_date: Optional[pd.Timestamp] = None
 ) -> pd.DataFrame:
     """
     拉取 Bybit V5 永续资金费率历史，按日聚合。
@@ -308,6 +381,7 @@ def bybit_funding_rate_daily(
         limit: 单页条数，接口上限 200。
         start_ms: 起始毫秒时间戳，默认 0 自最早时间拉取。
         agg: 日内聚合方式，默认均值。
+        start_date: 统一起始日期（UTC），仅用于结果过滤（Bybit startTime 需要对齐 8h，避免传参出错）。
     返回：
         含 date、fundingRate 的日频 DataFrame。
     """
@@ -355,12 +429,21 @@ def bybit_funding_rate_daily(
         return pd.DataFrame(columns=["date", "fundingRate"])
 
     daily = pd.concat(frames, ignore_index=True).sort_values("date")
-    return ensure_daily(daily, date_col="date", agg=agg)
+    filtered = apply_start_date_filter(daily, start_date, date_col="date")
+    return ensure_daily(filtered, date_col="date", agg=agg)
 
 
 # -------------------- Collectors: 链上 --------------------
 
-def blockchain_chart_daily(chart_id: str) -> pd.DataFrame:
+def blockchain_chart_daily(chart_id: str, start_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """
+    获取 Blockchain.com charts 的日频数据。
+    参数：
+        chart_id: 指标 ID，例如 hash-rate、difficulty。
+        start_date: 统一起始日期，若提供则在获取后按日期裁剪。
+    返回：
+        含 date、value 的日频 DataFrame。
+    """
     url = f"https://api.blockchain.info/charts/{chart_id}"
     r = http_get(url, params={"timespan": "all", "format": "json"})
     vals = r.json().get("values", [])
@@ -369,12 +452,20 @@ def blockchain_chart_daily(chart_id: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "value"])
     df["date"] = df["x"].apply(lambda x: to_utc_date(x, unit="s"))
     df["value"] = pd.to_numeric(df["y"], errors="coerce")
-    return df[["date", "value"]]
+    return apply_start_date_filter(df[["date", "value"]], start_date, date_col="date")
 
 
 # -------------------- Collectors: 情绪/关注度/流动性 --------------------
 
-def altme_fng_daily(limit: int = 0) -> pd.DataFrame:
+def altme_fng_daily(limit: int = 0, start_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """
+    获取 Alternative.me Fear&Greed 指数。
+    参数：
+        limit: 返回条数，0 表示全历史。
+        start_date: 统一起始日期，若提供则按 date 过滤。
+    返回：
+        含 date、index 的日频 DataFrame，date 为 UTC 日期。
+    """
     url = "https://api.alternative.me/fng/"
     params = {"limit": limit, "format": "json"}
     r = http_get(url, params=params)
@@ -384,21 +475,47 @@ def altme_fng_daily(limit: int = 0) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "index"])
     df["date"] = df["timestamp"].apply(lambda x: to_utc_date(int(x), unit="s"))
     df["index"] = pd.to_numeric(df["value"], errors="coerce")
-    return df[["date", "index"]]
+    return apply_start_date_filter(df[["date", "index"]], start_date, date_col="date")
 
 
-def wikipedia_pageviews_daily(article: str = "Bitcoin", project: str = "en.wikipedia.org") -> pd.DataFrame:
+def wikipedia_pageviews_daily(
+    article: str = "Bitcoin",
+    project: str = "en.wikipedia.org",
+    start_date: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
     """
     获取指定维基百科条目的日度页面浏览量（PV），覆盖 2015-07-01 至今。
     参数：
         article: 维基百科条目名，默认 "Bitcoin"。
         project: 站点，默认 "en.wikipedia.org"。
+        start_date: 统一起始日期，未传则从 2015-07-01 起。
     返回：
         含 date、views 的日频 DataFrame，date 为 UTC 日期，views 为整数 PV。
     """
-    end = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    now_ts = pd.Timestamp.utcnow()
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize("UTC")
+    else:
+        now_ts = now_ts.tz_convert("UTC")
+    today = now_ts.normalize()
+    base_start = start_date if start_date is not None else "2015-07-01"
+    start = pd.to_datetime(arg=base_start, utc=True).normalize()
+    if start > today:
+        raise ValueError("开始日期不可晚于当前日期")
+    end = today.strftime("%Y%m%d")
+    start_str = start.strftime("%Y%m%d")
     # 官方 REST 路径：/metrics/pageviews/per-article/{project}/all-access/all-agents/{article}/daily/{start}/{end}
-    url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{project}/all-access/all-agents/{article}/daily/20150701/{end}"
+    endpoint = (
+        "/metrics/pageviews/per-article/"
+        "{project}/all-access/all-agents/"
+        "{article}/daily/{start}/{end}"
+    )
+    url = "https://wikimedia.org/api/rest_v1" + endpoint.format(
+        project=project,
+        article=article,
+        start=start_str,
+        end=end
+    )
     r = http_get(url)
     items = r.json().get("items", [])
     df = pd.DataFrame(items)
@@ -406,10 +523,17 @@ def wikipedia_pageviews_daily(article: str = "Bitcoin", project: str = "en.wikip
         return pd.DataFrame(columns=["date", "views"])
     df["date"] = pd.to_datetime(df["timestamp"], format="%Y%m%d%H", utc=True).dt.normalize()
     df["views"] = pd.to_numeric(df["views"], errors="coerce")
-    return df[["date", "views"]]
+    return apply_start_date_filter(df[["date", "views"]], start, date_col="date")
 
 
-def defillama_stablecoins_daily() -> pd.DataFrame:
+def defillama_stablecoins_daily(start_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """
+    拉取 DefiLlama 稳定币总流通量，返回日频时间序列。
+    参数：
+        start_date: 统一起始日期，若提供则按 date 过滤。
+    返回：
+        含 date、total_circulating_usd 的 DataFrame。
+    """
     url = "https://stablecoins.llama.fi/stablecoincharts/all"
     r = http_get(url)
     data = r.json()
@@ -433,17 +557,29 @@ def defillama_stablecoins_daily() -> pd.DataFrame:
     df = pd.DataFrame(records)
     if df.empty:
         return pd.DataFrame(columns=["date", "total_circulating_usd"])
-    return df.sort_values("date")
+    ordered = df.sort_values("date")
+    return apply_start_date_filter(ordered, start_date, date_col="date")
 
 
 # -------------------- Collectors: 宏观 --------------------
 
-def fred_series_daily(series_id: str, api_key_env: str = "FRED_API_KEY") -> pd.DataFrame:
+def fred_series_daily(series_id: str, api_key_env: str = "FRED_API_KEY", start_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """
+    获取 FRED 日频序列。
+    参数：
+        series_id: FRED 序列 ID。
+        api_key_env: 存放 API key 的环境变量名。
+        start_date: 统一起始日期，会传入 observation_start 并在本地再裁剪。
+    返回：
+        含 date、value 的 DataFrame。
+    """
     api_key = os.getenv(api_key_env)
     if not api_key:
         raise RuntimeError(f"{api_key_env} not set")
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {"series_id": series_id, "api_key": api_key, "file_type": "json"}
+    if start_date is not None:
+        params["observation_start"] = start_date.date().isoformat()
     r = http_get(url, params=params)
     obs = r.json().get("observations", [])
     df = pd.DataFrame(obs)
@@ -451,7 +587,7 @@ def fred_series_daily(series_id: str, api_key_env: str = "FRED_API_KEY") -> pd.D
         return pd.DataFrame(columns=["date", "value"])
     df["date"] = pd.to_datetime(df["date"], utc=True).dt.normalize()
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df[["date", "value"]]
+    return apply_start_date_filter(df[["date", "value"]], start_date, date_col="date")
 
 
 def yfinance_series_daily(ticker: str) -> pd.DataFrame:
@@ -476,11 +612,12 @@ def yfinance_series_daily(ticker: str) -> pd.DataFrame:
     return df[["date", "value"]].sort_values("date")
 
 
-def stooq_series_daily(ticker: str) -> pd.DataFrame:
+def stooq_series_daily(ticker: str, start_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
     """
     从 Stooq 获取日线收盘价，避免代理需求。
     参数：
         ticker: Stooq 符号（如黄金可用 xauusd）。
+        start_date: 统一起始日期，若提供则按 date 裁剪。
     返回：
         含 date、value 的日频 DataFrame。
     """
@@ -505,17 +642,35 @@ def stooq_series_daily(ticker: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["Data"], utc=True, errors="coerce").dt.normalize()
     df["value"] = pd.to_numeric(df[close_col], errors="coerce")
     out = df[["date", "value"]].dropna(subset=["date"]).sort_values("date")
-    return out
+    return apply_start_date_filter(out, start_date, date_col="date")
 
 
 # -------------------- Collectors: 本地/需 key --------------------
 
-def glassnode_metric_daily(path: str, asset: str = "BTC", api_key_env: str = "GLASSNODE_API_KEY") -> pd.DataFrame:
+def glassnode_metric_daily(
+    path: str,
+    asset: str = "BTC",
+    api_key_env: str = "GLASSNODE_API_KEY",
+    start_date: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
+    """
+    通过 Glassnode API 拉取日频指标。
+    参数：
+        path: 指标路径（不含域名）。
+        asset: 资产符号。
+        api_key_env: key 所在环境变量。
+        start_date: 统一起始日期，若提供则传入参数 s 并在本地裁剪。
+    返回：
+        含 date、value 的 DataFrame。
+    """
     api_key = os.getenv(api_key_env)
     if not api_key:
         raise RuntimeError(f"{api_key_env} not set")
     url = f"https://api.glassnode.com{path}"
     params = {"a": asset, "i": "24h", "api_key": api_key}
+    if start_date is not None:
+        start_ts = pd.to_datetime(arg=start_date, utc=True)
+        params["s"] = int(start_ts.timestamp())
     r = http_get(url, params=params)
     data = r.json()
     records = []
@@ -527,10 +682,24 @@ def glassnode_metric_daily(path: str, asset: str = "BTC", api_key_env: str = "GL
     df = pd.DataFrame(records)
     if df.empty:
         return pd.DataFrame(columns=["date", "value"])
-    return df.sort_values("date")
+    ordered = df.sort_values("date")
+    return apply_start_date_filter(ordered, start_date, date_col="date")
 
 
-def binance_metrics_local(csv_path: str = "crypto_metrics_daily.csv", symbol: str = "BTCUSDT") -> pd.DataFrame:
+def binance_metrics_local(
+    csv_path: str = "crypto_metrics_daily.csv",
+    symbol: str = "BTCUSDT",
+    start_date: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
+    """
+    从本地 CSV 读取已对齐的日频指标。
+    参数：
+        csv_path: CSV 路径。
+        symbol: 需要过滤的交易对。
+        start_date: 统一起始日期，若提供则按 date 过滤。
+    返回：
+        含 date 与各数值列的 DataFrame。
+    """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"{csv_path} not found")
     df = pd.read_csv(csv_path)
@@ -543,19 +712,52 @@ def binance_metrics_local(csv_path: str = "crypto_metrics_daily.csv", symbol: st
         return pd.DataFrame(columns=["date"])
     non_value_cols = {"date", "symbol"}
     value_cols = [c for c in df.columns if c not in non_value_cols]
-    return df[["date"] + value_cols].sort_values("date")
+    ordered = df[["date"] + value_cols].sort_values("date")
+    return apply_start_date_filter(ordered, start_date, date_col="date")
 
 
-def cryptocompare_chain_pct(fsym: str = "BTC", limit: int = 2000, api_key_env: str = "CRYPTOCOMPARE_API_KEY") -> pd.DataFrame:
+def cryptocompare_chain_pct(
+    fsym: str = "BTC",
+    limit: int = 2000,
+    api_key_env: str = "CRYPTOCOMPARE_API_KEY",
+    start_date: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
     """
-    使用 Cryptocompare 免费链上端点，计算主字段的日度环比（pct_change），按日对齐。
+    使用 Cryptocompare 链上端点获取日频数据并计算核心字段环比。
+    参数：
+        fsym: 资产符号，默认 "BTC"，需为 Cryptocompare 支持的链上资产。
+        limit: 拉取的最大天数，接口上限 2000，默认 2000。
+        api_key_env: 存放 Cryptocompare API Key 的环境变量名，默认 "CRYPTOCOMPARE_API_KEY"。
+        start_date: 统一起始日期，若提供则计算所需的最小 limit 并本地裁剪。
+    返回：
+        含 date 及各字段日度环比的 DataFrame，若无数据返回空表。
     """
-    api_key = os.getenv(api_key_env) or "564bb9f7896bec544f6d04889f1479ff3471e55abe78c4fb741033ac114e4c6e"
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        raise RuntimeError(f"{api_key_env} not set")
+
     url = "https://min-api.cryptocompare.com/data/blockchain/histo/day"
-    params = {"fsym": fsym, "limit": limit}
+    effective_limit = limit
+    if start_date is not None:
+        # limit 表示返回的点数-1，按天数估算需要的长度，至少拉取 1 天。
+        now_ts = pd.Timestamp.utcnow()
+        if now_ts.tzinfo is None:
+            today_utc = now_ts.tz_localize("UTC").normalize()
+        else:
+            today_utc = now_ts.tz_convert("UTC").normalize()
+        start_ts = pd.to_datetime(arg=start_date)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        else:
+            start_ts = start_ts.tz_convert("UTC")
+        start_ts = start_ts.normalize()
+        days_needed = int((today_utc - start_ts).days) + 2
+        effective_limit = min(limit, max(days_needed, 1))
+    params = {"fsym": fsym, "limit": effective_limit}
     headers = {"authorization": f"Apikey {api_key}", "Accept": "application/json"}
 
-    last_exc: Optional[Exception] = None
+    # Cryptocompare 免费层易返回 429/5xx，这里做轻量级重试。
+    last_exc: Optional[requests.RequestException] = None
     for i in range(3):
         try:
             r = SESSION.get(url, params=params, headers=headers, timeout=(5, 20))
@@ -565,8 +767,8 @@ def cryptocompare_chain_pct(fsym: str = "BTC", limit: int = 2000, api_key_env: s
             r.raise_for_status()
             data = r.json()
             break
-        except Exception as e:
-            last_exc = e
+        except requests.RequestException as exc:
+            last_exc = exc
             time.sleep(1.5 * (i + 1))
     else:
         if last_exc:
@@ -598,14 +800,22 @@ def cryptocompare_chain_pct(fsym: str = "BTC", limit: int = 2000, api_key_env: s
     numeric_cols = [c for c in df.columns if c != "date"]
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    pct_df = df.sort_values("date").copy()
-    pct_df[numeric_cols] = pct_df[numeric_cols].pct_change().replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
-    return pct_df
+    ordered = df.sort_values("date").copy()
+    filtered = apply_start_date_filter(ordered, start_date, date_col="date")
+    if filtered is None or filtered.empty:
+        return filtered
+    filtered[numeric_cols] = filtered[numeric_cols].pct_change().replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
+    return filtered
 
 
 # -------------------- 注册表 --------------------
 
 def build_registry() -> List[Dataset]:
+    """
+    构建所有数据集的注册表，统一描述元信息与采集函数。
+    返回：
+        Dataset 列表，每个包含端点、参数、采集器及聚合方式。
+    """
     reg: List[Dataset] = []
 
     # 衍生品
@@ -614,7 +824,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/funding",
         endpoint="https://fapi.binance.com/fapi/v1/fundingRate",
         params={"symbol": "BTCUSDT", "limit": 1000, "startTime": 1},
-        collector=lambda **_: binance_funding_rate_daily(symbol="BTCUSDT", limit=1000, start_ms=1),
+        collector=lambda start_date=None, **_: binance_funding_rate_daily(symbol="BTCUSDT", limit=1000, start_ms=1, start_date=start_date),
         agg="mean",
         remark="8h→日均 | startTime>0 自最早端分页，自动适配降序响应"
     ))
@@ -623,7 +833,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/index_price",
         endpoint="https://fapi.binance.com/fapi/v1/indexPriceKlines",
         params={"pair": "BTCUSDT", "interval": "1d", "limit": 1500},
-        collector=lambda **_: binance_kline_daily("/fapi/v1/indexPriceKlines", "pair", "BTCUSDT", "index_close", 1500),
+        collector=lambda start_date=None, **_: binance_kline_daily("/fapi/v1/indexPriceKlines", "pair", "BTCUSDT", "index_close", 1500, start_date=start_date),
         agg="last",
         remark="指数价 close"
     ))
@@ -632,7 +842,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/premium_index",
         endpoint="https://fapi.binance.com/fapi/v1/premiumIndexKlines",
         params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1500},
-        collector=lambda **_: binance_kline_daily("/fapi/v1/premiumIndexKlines", "symbol", "BTCUSDT", "premium_close", 1500),
+        collector=lambda start_date=None, **_: binance_kline_daily("/fapi/v1/premiumIndexKlines", "symbol", "BTCUSDT", "premium_close", 1500, start_date=start_date),
         agg="last",
         remark="溢价指数 close"
     ))
@@ -641,7 +851,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/mark_price",
         endpoint="https://fapi.binance.com/fapi/v1/markPriceKlines",
         params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1500},
-        collector=lambda **_: binance_kline_daily("/fapi/v1/markPriceKlines", "symbol", "BTCUSDT", "mark_close", 1500),
+        collector=lambda start_date=None, **_: binance_kline_daily("/fapi/v1/markPriceKlines", "symbol", "BTCUSDT", "mark_close", 1500, start_date=start_date),
         agg="last",
         remark="标记价 close"
     ))
@@ -650,7 +860,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/funding",
         endpoint="https://api.bybit.com/v5/market/funding/history",
         params={"category": "linear", "symbol": "BTCUSDT", "limit": 200, "startTime": 0},
-        collector=lambda **_: bybit_funding_rate_daily(symbol="BTCUSDT", category="linear", limit=200, start_ms=0),
+        collector=lambda start_date=None, **_: bybit_funding_rate_daily(symbol="BTCUSDT", category="linear", limit=200, start_ms=0, start_date=start_date),
         agg="mean",
         remark="8h→日均 | params={\"category\": \"linear\", \"symbol\": \"BTCUSDT\", \"limit\": 200, \"startTime\": 0}"
     ))
@@ -658,14 +868,14 @@ def build_registry() -> List[Dataset]:
     # 链上：Blockchain.com 各指标
     for cid in ["hash-rate", "difficulty", "mempool-size", "n-transactions", "transaction-fees", "n-unique-addresses"]:
         reg.append(Dataset(
-            dataset_id=f"blockchain_{cid.replace('-', '_')}",
-            category="onchain/blockchain_com",
-            endpoint=f"https://api.blockchain.info/charts/{cid}",
-            params={"timespan": "all", "format": "json"},
-            collector=lambda cid=cid, **_: blockchain_chart_daily(cid),
-            agg="last",
-            remark="Blockchain.com Charts 日频 | 早期链上数据稀疏，建模建议 2020-01-01 之后使用"
-        ))
+        dataset_id=f"blockchain_{cid.replace('-', '_')}",
+        category="onchain/blockchain_com",
+        endpoint=f"https://api.blockchain.info/charts/{cid}",
+        params={"timespan": "all", "format": "json"},
+        collector=lambda start_date=None, cid=cid, **_: blockchain_chart_daily(cid, start_date=start_date),
+        agg="last",
+        remark="Blockchain.com Charts 日频 | 早期链上数据稀疏，建模建议 2020-01-01 之后使用"
+    ))
 
     # 情绪/关注度/流动性
     reg.append(Dataset(
@@ -673,7 +883,7 @@ def build_registry() -> List[Dataset]:
         category="sentiment",
         endpoint="https://api.alternative.me/fng/",
         params={"limit": 0},
-        collector=lambda **_: altme_fng_daily(limit=0),
+        collector=lambda start_date=None, **_: altme_fng_daily(limit=0, start_date=start_date),
         agg="last",
         remark="Fear&Greed 全历史"
     ))
@@ -682,16 +892,16 @@ def build_registry() -> List[Dataset]:
         category="attention",
         endpoint="https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article",
         params={"article": "Bitcoin", "project": "en.wikipedia.org"},
-        collector=lambda **_: wikipedia_pageviews_daily(article="Bitcoin", project="en.wikipedia.org"),
+        collector=lambda start_date=None, **_: wikipedia_pageviews_daily(article="Bitcoin", project="en.wikipedia.org", start_date=start_date),
         agg="sum",
-        remark="2015-07-01 起 en.wikipedia Bitcoin 条目 PV"
+        remark="2015-07-01 起 en.wikipedia Bitcoin 条目 PV | params={\"article\":\"Bitcoin\",\"project\":\"en.wikipedia.org\"}"
     ))
     reg.append(Dataset(
         dataset_id="defillama_stablecoins_total",
         category="liquidity/stablecoin",
         endpoint="https://stablecoins.llama.fi/stablecoincharts/all",
         params={},
-        collector=lambda **_: defillama_stablecoins_daily(),
+        collector=lambda start_date=None, **_: defillama_stablecoins_daily(start_date=start_date),
         agg="last",
         remark="全稳定币流通总量"
     ))
@@ -708,14 +918,14 @@ def build_registry() -> List[Dataset]:
     ]
     for sid, name, desc in fred_series:
         reg.append(Dataset(
-            dataset_id=name,
-            category="macro/fred",
-            endpoint="https://api.stlouisfed.org/fred/series/observations",
-            params={"series_id": sid, "file_type": "json", "api_key": "${FRED_API_KEY}"},
-            collector=lambda sid=sid, **_: fred_series_daily(sid),
-            agg="last",
-            remark=f"{desc} | 需要 FRED_API_KEY"
-        ))
+        dataset_id=name,
+        category="macro/fred",
+        endpoint="https://api.stlouisfed.org/fred/series/observations",
+        params={"series_id": sid, "file_type": "json", "api_key": "${FRED_API_KEY}"},
+        collector=lambda start_date=None, sid=sid, **_: fred_series_daily(sid, start_date=start_date),
+        agg="last",
+        remark=f"{desc} | 需要 FRED_API_KEY"
+    ))
 
     # 宏观：Stooq（无 key，用于黄金现货）
     reg.append(Dataset(
@@ -723,20 +933,9 @@ def build_registry() -> List[Dataset]:
         category="macro/stooq",
         endpoint="https://stooq.pl/q/d/l/",
         params={"ticker": "xauusd", "interval": "d"},
-        collector=lambda **_: stooq_series_daily("xauusd"),
+        collector=lambda start_date=None, **_: stooq_series_daily("xauusd", start_date=start_date),
         agg="last",
         remark="Stooq XAUUSD 收盘价，无需代理/无需 key（FRED 无黄金现货价格）"
-    ))
-
-    # Glassnode（需 key）
-    reg.append(Dataset(
-        dataset_id="glassnode_active_addresses_btc",
-        category="onchain/glassnode",
-        endpoint="https://api.glassnode.com/v1/metrics/addresses/active_count",
-        params={"a": "BTC", "i": "24h", "api_key": "${GLASSNODE_API_KEY}"},
-        collector=lambda **_: glassnode_metric_daily("/v1/metrics/addresses/active_count", asset="BTC"),
-        agg="last",
-        remark="需要 GLASSNODE_API_KEY"
     ))
 
     # Cryptocompare 链上环比
@@ -744,10 +943,10 @@ def build_registry() -> List[Dataset]:
         dataset_id="cryptocompare_btc_chain_pct",
         category="onchain/cryptocompare",
         endpoint="https://min-api.cryptocompare.com/data/blockchain/histo/day",
-        params={"fsym": "BTC", "limit": 2000, "api_key": "${CRYPTOCOMPARE_API_KEY or built-in}"},
-        collector=lambda **_: cryptocompare_chain_pct(fsym="BTC", limit=2000),
+        params={"fsym": "BTC", "limit": 2000, "api_key": "${CRYPTOCOMPARE_API_KEY}"},
+        collector=lambda start_date=None, **_: cryptocompare_chain_pct(fsym="BTC", limit=2000, start_date=start_date),
         agg="mean",
-        remark="链上核心字段环比，免费 key 可用 | 字段: transaction_count, new_addresses, active_addresses, average_transaction_value, block_height, hashrate, difficulty, block_time, block_size, current_supply"
+        remark="链上核心字段环比，需要 CRYPTOCOMPARE_API_KEY（置于 .env） | 字段: transaction_count, new_addresses, active_addresses, average_transaction_value, block_height, hashrate, difficulty, block_time, block_size, current_supply"
     ))
 
     # 本地 metrics（可选）
@@ -756,7 +955,7 @@ def build_registry() -> List[Dataset]:
         category="derivatives/local",
         endpoint="file://crypto_metrics_daily.csv",
         params={"symbol": "BTCUSDT"},
-        collector=lambda **_: binance_metrics_local(csv_path="crypto_metrics_daily.csv", symbol="BTCUSDT"),
+        collector=lambda start_date=None, **_: binance_metrics_local(csv_path="crypto_metrics_daily.csv", symbol="BTCUSDT", start_date=start_date),
         agg="last",
         remark="本地 metrics CSV，如缺失会报错"
     ))
@@ -767,12 +966,18 @@ def build_registry() -> List[Dataset]:
 # -------------------- 主流程 --------------------
 
 def main():
+    """
+    CLI 入口：加载 .env，按统一参数采集样本，并输出汇总 CSV。
+    支持指定输出路径、样本长度及统一起始日期。
+    """
     # 在 CLI 模式再次尝试加载 .env，确保 CLI 调用时 key 可用。
     load_env_from_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="datasets_unified_summary.csv", help="输出 CSV 路径")
     ap.add_argument("--limit", type=int, default=300, help="从最早日期起抽取的日样本长度")
+    ap.add_argument("--start-date", default=None, help="统一起始日期，形如 2020-01-01（UTC）")
     args = ap.parse_args()
+    start_date = normalize_start_date(args.start_date)
 
     reg = build_registry()
     rows = []
@@ -782,8 +987,9 @@ def main():
         sample_df = pd.DataFrame()
         err_msg = None
         try:
-            raw = ds.collector()
+            raw = ds.collector(start_date=start_date)
             daily = ensure_daily(raw, date_col="date", agg=ds.agg)
+            daily = apply_start_date_filter(daily, start_date, date_col="date")
             if not daily.empty:
                 earliest_date = pd.to_datetime(daily["date"].min(), utc=True).date().isoformat()
                 sample_df = sample_first_n_days(daily, n=args.limit, date_col="date")
