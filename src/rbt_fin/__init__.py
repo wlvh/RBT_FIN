@@ -49,6 +49,7 @@ from .errors import (
     RbtFinError,
     ResponseSchemaError,
     RevisionConflictError,
+    SourceBlockedError,
     StaleCacheError,
     StorageError,
     TimeContractError,
@@ -82,6 +83,6 @@ __all__ = [
     "RbtFinError", "ConfigError", "AcquisitionError", "HttpStatusError",
     "BusinessStatusError", "ResponseSchemaError", "PaginationError", "BudgetExhaustedError",
     "ContractError", "TimeContractError", "ValueContractError", "CoverageError",
-    "RevisionConflictError", "StorageError", "LockError", "CacheCorruptionError",
+    "RevisionConflictError", "SourceBlockedError", "StorageError", "LockError", "CacheCorruptionError",
     "PublishError", "CacheEligibilityError", "OfflineUnavailableError", "StaleCacheError",
 ]

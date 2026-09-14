@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbt-fin"
-version = "0.1.0"
+version = "0.2.0"
 description = "统一的加密与宏观数据采集层：公共缓存/校验/内容寻址存储流程 + 分钟行情"
 readme = "README.md"
 requires-python = ">=3.9"

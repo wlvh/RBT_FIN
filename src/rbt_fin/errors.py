@@ -44,6 +44,15 @@ class ResponseSchemaError(AcquisitionError):
     """响应结构与适配器预期不符（字段缺失、类型错误、行宽不足）。"""
 
 
+class SourceBlockedError(AcquisitionError):
+    """
+    来源在当前运行环境被拦截（反爬页、JS 挑战、地域限制等），而不是协议漂移。
+
+    为什么单独成类型：`ResponseSchemaError` 意味着"字段变了，去改代码"，
+    而这里意味着"换出口或换来源"。两者混用会把运维引向错误的排查方向。
+    """
+
+
 class PaginationError(AcquisitionError):
     """分页协议异常：重复页、游标不推进、返回越界记录。"""
 

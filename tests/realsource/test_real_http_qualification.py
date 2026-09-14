@@ -180,3 +180,34 @@ def test_real_funding_start_time_semantics(start_time_mode):
     assert isinstance(payload, list)
     observed = [item["fundingTime"] for item in payload][:3]
     print(f"\nSTART_TIME_OBSERVATION mode={start_time_mode} first_funding_times={observed}")
+
+
+# ----------------------------- WP2：全注册表真实来源资格 -----------------------------
+
+def test_registry_status_has_no_implementation_failure(tmp_path, capsys):
+    """
+    对全部注册标识做一次真实来源探测，断言**没有实现失败**。
+
+    Why 用一条汇总断言而不是给 9 个可达来源各写一个几乎相同的用例：
+        每个来源的协议细节已经由离线测试逐条覆盖（`tests/unit/test_wp2_source_protocols.py`）。
+        真实来源这一层要回答的是另一个问题——"在真网络下，失败是环境阻塞还是我们的 bug"。
+        把它做成一条断言，同时把逐项证据打印出来归档，比复述 9 遍更有用。
+
+    缺 key、地域限制、反爬拦截都是**环境阻塞**，不会让本用例失败；
+    只有 `implementation_failure` / `source_error` 才会。
+    """
+    import json
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+    from registry_status import build_status
+
+    report = build_status(work_dir=tmp_path, offline_only=False)
+    broken = [
+        item for item in report["items"]
+        if item["real_source"]["status"] in ("implementation_failure", "source_error")
+    ]
+    print("\nREGISTRY_STATUS " + json.dumps(report["real_source_summary"], ensure_ascii=False))
+    for item in report["items"]:
+        print(f"  {item['registered_id']:34s} {item['real_source']['status']}")
+    assert broken == [], f"存在实现失败项: {[b['registered_id'] for b in broken]}"

@@ -18,23 +18,35 @@
 ## 安装
 
 ```bash
-pip install rbt_fin-0.1.0-py3-none-any.whl
+pip install rbt_fin-0.2.0-py3-none-any.whl
 ```
 
 基础依赖只有 `pandas` 与 `requests`。个别低频来源的可选依赖（如 `yfinance`）不影响
 安装与核心行情能力。
 
-## 当前状态（WP1）
+## 当前状态
 
-已通过公共流程接入并有离线证据的数据集：
+全部 **25 个基线注册项**已接入公共流程，另有 3 个新增数据集（分钟行情、现货镜像、本地样例）。
+对外注册标识共 30 个 = 26 个基础数据集 + 4 个别名。
 
-| dataset_id | 说明 | 覆盖判定 |
-|---|---|---|
-| `btcusdt_perp_1m` | BTCUSDT USDⓈ-M 期货成交价 1m（trading 批次输入的行情来源） | 严格分钟网格 |
-| `binance_funding_btcusdt_raw` | Binance 资金费率**原始结算记录**（日均是派生视图） | 事件流，日历未验证 |
-| `local_metrics_sample` | 本地 CSV 导入样例（不联网） | 非规则序列，日历未验证 |
+| 采集函数 | 注册项 | 说明 |
+|---|---:|---|
+| `binance_klines`（分钟行情） | 1 | BTCUSDT USDⓈ-M 期货成交价 1m；trading 批次输入来源 |
+| `binance_reference_price` | 3 | 指数价 / 标记价 / 溢价指数；占位 `volume` 不外露，溢价可为负 |
+| `binance_funding` | 1 | 原始结算记录；日均是派生视图 |
+| `bybit_funding` | 1 | `retCode != 0` 立即失败；首页不传 `startTime` |
+| `daily_series`（通用） | 17 | Blockchain.com ×6 / Fear&Greed / Wikipedia / DefiLlama / FRED ×5 / Stooq / Glassnode / CryptoCompare |
+| `local_csv` | 2 | 本地导入，不联网 |
+| FRED 别名 | 4 | 同序列的第二个注册名解析到同一数据集，**不重复下载** |
 
-其余注册项在 WP2 接入，见 Issue #5 §9。
+逐项状态（已接入 / 离线结果 / 真实验证 / 阻塞原因）用以下命令生成：
+
+```bash
+python tools/registry_status.py --work-dir /tmp/status --out status.json
+```
+
+它把「缺 key」「来源不可达」「反爬拦截」与「实现失败」严格分开——
+这三类阻塞不是验收通过，但也不是代码缺陷。
 
 ## 使用
 
@@ -90,10 +102,13 @@ rbt-fin export-trading-csv --cache-root <dir> --dataset btcusdt_perp_1m \
 缺少配置时相关来源会直接失败，不会退化成“零缺失”的正常输出。
 
 ```
-FRED_API_KEY=...
-GLASSNODE_API_KEY=...
-CRYPTOCOMPARE_API_KEY=...
+FRED_API_KEY=...          # FRED 五个序列（七个注册名）
+GLASSNODE_API_KEY=...     # glassnode_active_addresses_btc
+CRYPTOCOMPARE_API_KEY=... # cryptocompare_btc_chain_pct
 ```
+
+凭据只在真正发请求时合入，**永不进入** `dataset.params`、`manifest.json` 或日志。
+缺配置时对应来源直接 Fail Fast，不会表现成「零缺失」的正常输出。
 
 ## 兼容入口
 

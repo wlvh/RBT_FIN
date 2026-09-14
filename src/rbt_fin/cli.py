@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -30,7 +31,7 @@ from .errors import RbtFinError
 from .exports import export_trading_csv
 from .http import HttpClient, RequestBudget, build_session
 from .pipeline import acquire_dataset
-from .registry import build_registry, get_dataset
+from .registry import build_registry, get_dataset, list_registered_ids
 from .storage import DatasetStore
 from .timeutils import require_utc
 
@@ -52,6 +53,24 @@ def _parse_time(value: str, *, arg_name: str) -> pd.Timestamp:
             f"{arg_name}={value!r} 缺少时区；请使用带时区的 ISO-8601，例如 2026-01-01T00:00:00Z"
         )
     return require_utc(parsed, arg_name=arg_name)
+
+
+# 本库会用到的凭据环境变量。只在 CLI 入口按名字显式读取；
+# 库内部永远只拿到调用方传入的 `credentials` 映射，不自己碰 os.environ（Issue #5 §7）。
+CREDENTIAL_ENV_NAMES = ("FRED_API_KEY", "GLASSNODE_API_KEY", "CRYPTOCOMPARE_API_KEY")
+
+
+def _collect_credentials() -> dict:
+    """
+    从进程环境显式收集凭据。
+
+    为什么放在 CLI 而不是库里：`import rbt_fin` 不得读取 `.env`、不得修改进程环境。
+    凭据注入必须是入口的一个明确动作，且其值不会进入任何数据集参数或 manifest。
+
+    Returns:
+        `{环境变量名: 值}`；未设置的名字不会出现在结果里。
+    """
+    return {name: os.environ[name] for name in CREDENTIAL_ENV_NAMES if os.environ.get(name)}
 
 
 def _build_http(args: argparse.Namespace) -> Optional[HttpClient]:
@@ -86,6 +105,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         now_utc=pd.Timestamp.now(tz="UTC"),
         http=_build_http(args),
         local_inputs={"csv_path": args.local_csv} if args.local_csv else {},
+        credentials=_collect_credentials(),
     )
     print(json.dumps(result.usage_notes(), ensure_ascii=False, indent=2))
     return EXIT_OK
@@ -99,12 +119,17 @@ def cmd_overview(args: argparse.Namespace) -> int:
     不自动证明来源历史起点；采集失败的缺失率为未知（None）。
     """
     rows: List[dict] = []
-    for dataset in build_registry():
+    # 逐项列出**全部对外注册标识**（含别名）：基线的每个 dataset_id 都要能在概览里
+    # 回答自己的状态，而不是只显示合并后的基础数据集。
+    for registered_id in list_registered_ids():
+        dataset = get_dataset(registered_id)
+        alias_of = dataset.dataset_id if dataset.dataset_id != registered_id else None
         store = DatasetStore(root=Path(args.cache_root), dataset_id=dataset.dataset_id)
         manifest = store.read_manifest()
         if manifest is None:
             rows.append({
-                "dataset_id": dataset.dataset_id,
+                "dataset_id": registered_id,
+                "alias_of": alias_of,
                 "state": "uninitialized",
                 "identity": json.dumps(dict(dataset.identity), ensure_ascii=False, sort_keys=True),
                 "earliest_obtained_date": None,
@@ -119,7 +144,8 @@ def cmd_overview(args: argparse.Namespace) -> int:
             continue
         coverage = dict(manifest.coverage)
         rows.append({
-            "dataset_id": dataset.dataset_id,
+            "dataset_id": registered_id,
+            "alias_of": alias_of,
             "state": "initialized",
             "identity": json.dumps(dict(manifest.identity), ensure_ascii=False, sort_keys=True),
             "earliest_obtained_date": manifest.actual_start,

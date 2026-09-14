@@ -85,6 +85,9 @@ def parse_interval(interval: str) -> pd.Timedelta:
             f"interval={interval!r} 依赖交易所锚点，不支持 epoch floor 对齐；"
             "需要周/月周期时必须单独实现锚点逻辑。"
         )
+    # pandas 4 起弃用小写 'd'；'1m'(分钟) 与 '1M'(月) 是大小写敏感的，因此只归一化尾部的 'd'。
+    if cleaned.endswith("d"):
+        cleaned = cleaned[:-1] + "D"
     try:
         delta = pd.Timedelta(cleaned)
     except ValueError as exc:

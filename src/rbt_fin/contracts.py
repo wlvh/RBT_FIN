@@ -79,6 +79,11 @@ class Dataset:
         time_column: 主键时间列名（落盘后的列名；索引统一还原为该列）。
         time_meaning: 该时间的业务含义，例如 'bar_open_time' / 'funding_settlement_time'。
         value_columns: 数据列名（有序）。
+        nullable_columns: 允许出现"未定义"（NaN）的列子集，且必须说明理由。
+                          Why 需要这个声明：观测字段缺失是数据质量问题，必须 Fail Fast；
+                          但派生的比率字段在首次记录/缺失前值/零分母处**本就没有定义**，
+                          把它填成 0.0 才是错的（Issue #5 §4.4）。两者不能用同一条规则，
+                          又不能笼统放开——所以由数据集逐列显式声明。
         grid: 严格网格；`None` 表示非规则序列（低频/事件流），覆盖判定走非网格分支。
         default_refresh_interval: 默认重新检查来源的间隔。
         schema_version: 落盘 schema 版本；变更后旧缓存不得直接复用。
@@ -103,6 +108,7 @@ class Dataset:
     schema_version: str
     transform_version: str
     grid: Optional[GridSpec] = None
+    nullable_columns: Tuple[str, ...] = ()
     revision_policy: str = REVISION_REJECT
     requires_network: bool = True
     point_in_time_verified: bool = False
@@ -122,6 +128,11 @@ class Dataset:
             raise ConfigError(f"{self.dataset_id}: value_columns 不能为空。")
         if self.time_column in self.value_columns:
             raise ConfigError(f"{self.dataset_id}: time_column 不能同时出现在 value_columns 中。")
+        unknown_nullable = [name for name in self.nullable_columns if name not in self.value_columns]
+        if unknown_nullable:
+            raise ConfigError(
+                f"{self.dataset_id}: nullable_columns 含未声明的列 {unknown_nullable}。"
+            )
         if not isinstance(self.default_refresh_interval, dt.timedelta):
             raise ConfigError(f"{self.dataset_id}: default_refresh_interval 必须是 timedelta。")
         if self.default_refresh_interval < dt.timedelta(0):

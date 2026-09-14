@@ -49,7 +49,19 @@ KLINES_ENDPOINTS = {
     "usdm_futures": "https://fapi.binance.com/fapi/v1/klines",
     "spot": "https://api.binance.com/api/v3/klines",
     "spot_data_mirror": "https://data-api.binance.vision/api/v3/klines",
+    # 三类参考价格。它们与成交价 K 线共用同一套数组形状与分页协议，因此复用同一条取数路径；
+    # 但语义完全不同：`volume` 恒为占位 "0"，绝不能当成成交量对外（Issue #5 §5）。
+    "usdm_index_price": "https://fapi.binance.com/fapi/v1/indexPriceKlines",
+    "usdm_mark_price": "https://fapi.binance.com/fapi/v1/markPriceKlines",
+    "usdm_premium_index": "https://fapi.binance.com/fapi/v1/premiumIndexKlines",
 }
+
+# 各端点用来指定标的的参数名。指数价用 `pair`，其余用 `symbol`——
+# 这一位差异不能靠"看起来都一样"推导，必须显式声明。
+KLINES_SYMBOL_PARAM = {
+    "usdm_index_price": "pair",
+}
+DEFAULT_SYMBOL_PARAM = "symbol"
 
 # Binance klines 单页上限。
 MAX_LIMIT = 1500
@@ -204,7 +216,7 @@ def fetch_klines_range(
 
     while cursor < end_ts:
         params = {
-            "symbol": symbol,
+            KLINES_SYMBOL_PARAM.get(market, DEFAULT_SYMBOL_PARAM): symbol,
             "interval": interval,
             "startTime": to_epoch_ms(cursor, arg_name=f"{context}.cursor"),
             "endTime": end_time_ms,

@@ -11,11 +11,14 @@
 - `validation.py`：严格网格 OHLCV 校验、非规则序列校验、严格数值解析（不使用 `coerce+dropna`）、按时间主键去重（同时间不同内容默认拒绝）。
 - `transforms.py`：少量显式转换——按 UTC 日期取日均 / 日内 last、保留基础值的环比（首次记录/零分母不填 0）。
 - `pipeline.py`：公共流程编排（`acquire_dataset`）与多数据集任务（`run_task`）。`last_verified_at` 只在真实来源成功解析并核验后推进。
-- `registry.py`：数据集注册表；`params` 既是 manifest 记录也是适配器真正读取的参数，不存在第二份硬编码。
+- `registry.py`：数据集注册表。`params` 既是 manifest 记录也是适配器真正读取的参数，不存在第二份硬编码。当前含 26 个基础数据集 + 4 个别名 = 30 个对外注册标识，**基线的 25 个 `dataset_id` 全部保留**。`DATASET_ALIASES` 让同序列的第二个注册名解析到**同一个 Dataset**，因此共用同一个缓存目录——重复的 FRED 序列不会重复下载。`list_registered_ids()` 是概览的真相源。
 - `exports.py`：trading 兼容 CSV 导出；导出文件有**自己的**哈希，与来源内容哈希分开保存。
 - `cli.py`：`update` / `overview`（只读，不触发采集）/ `verify` / `export-trading-csv`。
 - `sources/binance_klines.py`：分钟行情适配器。固定任务截止、增量只补缺失段、提前空页标记扫描未完成、重复页/游标不推进/越界记录 Fail Fast。
 - `sources/binance_funding.py`：资金费率适配器。每页保持固定 `endTime`、先落原始结算记录再聚合、`startTime` 恒为正值（不使用 `0` 哨兵）。
+- `sources/binance_reference_price.py`：Binance 三类参考价格（指数价 / 标记价 / 溢价指数）日频适配器。与 K 线共用分页路径，但**只保留 close**——这些端点的 `volume` 恒为占位 `"0"`，不是成交量；溢价指数可以为负，因此走单值网格校验而不是"价格必须为正"。
+- `sources/bybit_funding.py`：Bybit V5 资金费率适配器。`retCode != 0` 立即失败（基线只取 `result.list`，业务错误会伪装成"没有数据"）；首页不传 `startTime`、只带固定 `endTime`，随后向历史翻页；先落原始结算记录再聚合。
+- `sources/daily_series.py`：单次请求型日频序列的**唯一**通用取数路径，各来源只提供一个很小的 `extract` 函数（形状取自实测响应）。覆盖 Blockchain.com / Fear&Greed / Wikipedia / DefiLlama / FRED / Stooq / Glassnode / CryptoCompare。凭据只在发请求时合入，永不进入 `params` / manifest / 日志；Stooq 的 HTTP 200 + 反爬 HTML 页与"CSV 列名漂移"是两种不同错误。
 - `sources/local_csv.py`：本地导入适配器。不联网、不修改用户原文件、记录源文件哈希。
 
 ### 兼容入口
@@ -35,9 +38,12 @@
 - `tests/unit/test_golden_fixture_roundtrip.py`：固定 fixture → 公共流程 → golden CSV 的字节级回路（WP3 交接件）。
 - `tests/integration/test_interrupt_and_concurrency.py` + `child_worker.py`：真实子进程的提交前/提交后 SIGKILL，以及真实双写者无覆盖丢失。
 - `tests/realsource/test_real_http_qualification.py`：真实来源资格验证；默认被 `-m 'not realsource'` 排除，需显式 `pytest -m realsource`。来源因地域限制不可达时 skip 并打印证据，不伪装成通过。
+- `tests/unit/test_full_registry.py`：全注册表参数化测试——每个注册标识都走 acquire -> persist -> load -> cache-hit（第二次请求零网络，由"一被调用就失败"的替身断言）；基线 25 个 id 保留；FRED 别名解析一致且不重复下载；缺凭据 Fail Fast；凭据值不进 params/manifest。
+- `tests/unit/test_wp2_source_protocols.py`：来源专项协议测试——Bybit `retCode`/首页不传 startTime/游标不推进；Binance K 线与资金费率的 `startTime` 分别验证（不互推）；参考价占位 volume 不外露、溢价指数可为负、指数价必须为正；低频来源的非法数值/全空响应/字段变化/缺层定位；FRED 的 `.`；环比保留基础值且未定义处不填 0；全量重取时历史缩短保留旧数据并报错。
 - `tests/fixtures/`：独立构造的协议 fixture 与 golden CSV；不含任何真实凭据。
 
 ### 工具
+- `tools/registry_status.py`：逐项生成注册表接入状态矩阵（已接入 / 离线结果 / 真实验证结果 / 阻塞原因）。把"缺 key""来源不可达""反爬拦截"与"实现失败"严格分开——混在一起会让一次网络封锁看起来像验收通过。`--offline-only` 可完全离线运行。
 - `tools/scale_check.py`：贴近真实规模的一次性运行验证。测量生产规模（约 300 万行 1m）的校验/发布/读回/导出耗时与峰值内存、真实 HTTP 中等规模分页请求数，以及发布中途失败后的恢复。`--skip-network` 可完全离线运行。
 
 ### 运行

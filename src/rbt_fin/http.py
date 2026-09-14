@@ -127,6 +127,31 @@ class HttpClient:
         """剩余可用请求数。"""
         return self._budget.max_requests - self._requests_used
 
+    def get_text(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, Any],
+        context: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        发起一次 GET 并返回响应文本。
+
+        为什么需要它：不是所有来源都返回 JSON（例如 Stooq 返回 CSV）。
+        可靠性、预算与状态判定与 `get_json` 完全共用，只是不做 JSON 解析。
+
+        Args:
+            url: 完整 URL。
+            params: 查询参数。
+            context: 报错上下文。
+            headers: 本次请求附加头（例如 API key）；不会写入异常信息。
+
+        Returns:
+            响应文本。
+        """
+        return self._request(url=url, params=params, context=context, headers=headers).text
+
     def get_json(
         self,
         *,
@@ -155,6 +180,43 @@ class HttpClient:
 
         Returns:
             解析后的 JSON 对象。
+        """
+        response = self._request(url=url, params=params, context=context, headers=headers)
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ResponseSchemaError(
+                f"{context}: 响应不是合法 JSON，响应片段: {response.text[:200]!r}"
+            ) from exc
+        if business_check is not None:
+            # 业务状态与 HTTP 状态是两件事：200 不代表业务成功。
+            business_check(payload)
+        return payload
+
+    def _request(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, Any],
+        context: str,
+        headers: Optional[Dict[str, str]],
+    ):
+        """
+        执行一次带预算与有限重试的 GET，并把所有失败都变成异常。
+
+        失败语义（绝不返回"空数据"冒充成功）：
+            - 预算耗尽 -> BudgetExhaustedError
+            - 可重试状态 / 连接超时重试耗尽 -> HttpStatusError
+            - 不可重试的非 2xx -> HttpStatusError（立即失败，不重试）
+
+        Args:
+            url: 完整 URL。
+            params: 查询参数；调用方负责保证其中不含需要保密的凭据。
+            context: 报错上下文。
+            headers: 附加头；不会写入异常信息。
+
+        Returns:
+            `requests.Response`（已确认为 2xx）。
         """
         last_error: Optional[BaseException] = None
         # attempt 0 为首次尝试，其余为重试；总尝试次数 = max_retries + 1。
@@ -197,18 +259,7 @@ class HttpClient:
                 raise HttpStatusError(
                     f"{context}: HTTP {status} 非成功状态，响应片段: {response.text[:200]!r}"
                 )
-
-            try:
-                payload = response.json()
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise ResponseSchemaError(
-                    f"{context}: 响应不是合法 JSON，响应片段: {response.text[:200]!r}"
-                ) from exc
-
-            if business_check is not None:
-                # 业务状态与 HTTP 状态分别检查：200 不代表业务成功。
-                business_check(payload)
-            return payload
+            return response
 
         # 理论不可达：循环内所有分支要么 return 要么 raise。
         raise HttpStatusError(f"{context}: 请求未能完成，最后错误: {last_error!r}")

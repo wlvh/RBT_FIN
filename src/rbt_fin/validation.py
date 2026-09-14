@@ -267,6 +267,99 @@ def validate_strict_grid_ohlcv(
     )
 
 
+def validate_strict_grid_series(
+    frame: pd.DataFrame,
+    *,
+    dataset: Dataset,
+    request: DataRequest,
+    scan_complete: bool = True,
+    scan_note: str = "",
+) -> CoverageReport:
+    """
+    严格网格上的**单值序列**校验（例如 Binance 三类参考价格的日频序列）。
+
+    与 `validate_strict_grid_ohlcv` 的差别只有数值合同：
+        - 这里没有 OHLCV 的高低区间关系可查。
+        - 是否要求为正由数据集声明：指数价/标记价必须为正，**溢价指数可以为负**，
+          把它一并按"价格必须为正"校验会把合法数据判成违约。
+
+    Args:
+        frame: 索引为 tz-aware UTC 时间的数据帧。
+        dataset: 数据集定义（必须声明 `grid`；`params['require_positive']` 决定正值要求）。
+        request: 本次请求。
+        scan_complete: 采集端是否完成完整扫描。
+        scan_note: 扫描说明。
+
+    Returns:
+        CoverageReport。
+
+    Raises:
+        TimeContractError: 时间轴违约（不在网格上 / 重复 / 非升序）。
+        ValueContractError: 存在非有限值，或要求为正时出现非正值。
+    """
+    context = f"{dataset.dataset_id}"
+    if dataset.grid is None:
+        raise TimeContractError(f"{context}: 该数据集未声明严格网格，不能使用网格校验。")
+    interval = dataset.grid.interval
+
+    assert_on_grid(frame.index, interval=interval, context=context)
+    assert_strictly_increasing_unique(frame.index, context=context)
+
+    columns = list(dataset.value_columns)
+    missing_columns = [name for name in columns if name not in frame.columns]
+    if missing_columns:
+        raise ValueContractError(f"{context}: 缺少必需列 {missing_columns}。")
+    require_positive = bool(dataset.params["require_positive"])
+    for column in columns:
+        values = frame[column].to_numpy(dtype="float64")
+        if not np.isfinite(values).all():
+            rows = frame.index[~np.isfinite(values)]
+            raise ValueContractError(
+                f"{context}: 列 {column!r} 存在非有限值，示例索引: {[str(i) for i in rows[:5]]}"
+            )
+        if require_positive and (values <= 0).any():
+            rows = frame.index[values <= 0]
+            raise ValueContractError(
+                f"{context}: 列 {column!r} 存在非正值，示例索引: {[str(i) for i in rows[:5]]}"
+            )
+
+    in_range_mask = (frame.index >= request.start) & (frame.index < request.end_exclusive)
+    in_range = frame.index[in_range_mask]
+    extra_count = int((~in_range_mask).sum())
+    grid = expected_grid(
+        start=request.start, end_exclusive=request.end_exclusive, interval=interval
+    )
+    missing = grid.difference(in_range)
+    head, interior, tail, classify_note = _classify_missing(missing=missing, actual=in_range)
+
+    notes = [note for note in (scan_note, classify_note) if note]
+    if len(missing) == 0 and scan_complete:
+        status = COVERAGE_COMPLETE
+    elif len(missing) == 0 and not scan_complete:
+        status = COVERAGE_UNVERIFIED
+        notes.append("采集扫描未完成，缺口为 0 不能作为完整性证据。")
+    else:
+        status = COVERAGE_PARTIAL
+    if extra_count:
+        notes.append(f"正式数据另有 {extra_count} 条记录落在本次请求范围之外。")
+
+    return CoverageReport(
+        status=status,
+        checked_start=request.start,
+        checked_end_exclusive=request.end_exclusive,
+        actual_start=None if len(in_range) == 0 else in_range[0],
+        actual_end=None if len(in_range) == 0 else in_range[-1],
+        rows=int(len(in_range)),
+        missing_head=head,
+        missing_interior=interior,
+        missing_tail=tail,
+        missing_examples=tuple(str(ts) for ts in missing[:MISSING_EXAMPLE_LIMIT]),
+        extra_count=extra_count,
+        scan_complete=bool(scan_complete),
+        note=" | ".join(notes),
+    )
+
+
 def validate_irregular_series(
     frame: pd.DataFrame,
     *,
@@ -309,7 +402,12 @@ def validate_irregular_series(
     missing_columns = [col for col in columns if col not in frame.columns]
     if missing_columns:
         raise ValueContractError(f"{context}: 缺少必需字段 {missing_columns}（字段缺失 != 记录缺失）。")
+    # 只有数据集显式声明为"可未定义"的列才允许出现 NaN（例如派生比率的首期/零分母）。
+    # 其余列的空值一律是字段缺失，必须 Fail Fast，不允许静默填充。
+    nullable = set(dataset.nullable_columns)
     for column in columns:
+        if column in nullable:
+            continue
         if frame[column].isna().any():
             rows = frame.index[frame[column].isna()]
             raise ValueContractError(
