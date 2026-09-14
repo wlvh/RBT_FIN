@@ -10,6 +10,14 @@ Unified daily data layer
   [dataset_id, category, endpoint, earliest_date, sample_start, sample_end,
    sample_rows, na_cells, na_ratio, remark]
 
+刷新语义（重要）：
+    **本脚本是会触发刷新的兼容入口。** 每次运行都会对注册表中的每一项真实发起采集，
+    因此它既不是只读概览，也不提供缓存/覆盖保证。
+    只读概览请使用新入口：`rbt-fin overview --cache-root <dir>`，它不会更新任何来源。
+
+    本文件保留 `--out/--limit` 的原有用途，作为迁移期的兼容入口；
+    其各来源将在 WP2 中逐个迁移到 `rbt_fin` 的公共流程。
+
 用法示例：
     python data_layer_unified_opt.py --out datasets_unified_summary.csv --limit 300
 """
@@ -73,8 +81,9 @@ def load_env_from_dotenv(path: str = ".env", reload: bool = False) -> None:
     ENV_LOADED = True
 
 
-# 提前加载 .env，确保 key 可被各 collector 读取。
-load_env_from_dotenv()
+# 为什么不在模块导入时加载 .env：
+# 导入一个模块不应该修改进程环境。.env 的加载改到 `main()`（CLI 入口）里执行，
+# 让“谁在什么时候注入了凭据”始终是显式的。
 
 
 def http_get(
@@ -550,7 +559,14 @@ def cryptocompare_chain_pct(fsym: str = "BTC", limit: int = 2000, api_key_env: s
     """
     使用 Cryptocompare 免费链上端点，计算主字段的日度环比（pct_change），按日对齐。
     """
-    api_key = os.getenv(api_key_env) or "564bb9f7896bec544f6d04889f1479ff3471e55abe78c4fb741033ac114e4c6e"
+    # 安全：不再保留任何内置备用 key。缺少显式配置时必须 Fail Fast——
+    # 凭据失效 / 权限不足绝不能表现为“零缺失”的正常输出（RBT_FIN#5 §5）。
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        raise RuntimeError(
+            f"{api_key_env} not set；CryptoCompare 需要显式环境/配置提供凭据，"
+            "本模块不再提供内置备用 key。"
+        )
     url = "https://min-api.cryptocompare.com/data/blockchain/histo/day"
     params = {"fsym": fsym, "limit": limit}
     headers = {"authorization": f"Apikey {api_key}", "Accept": "application/json"}
@@ -767,8 +783,17 @@ def build_registry() -> List[Dataset]:
 # -------------------- 主流程 --------------------
 
 def main():
-    # 在 CLI 模式再次尝试加载 .env，确保 CLI 调用时 key 可用。
+    """
+    兼容 CLI 入口：对全部注册项真实采集一次并输出概览 CSV。
+
+    注意：本入口会触发刷新（每项都会发起真实请求），不是只读概览。
+    """
+    # 在 CLI 入口显式加载 .env：凭据注入是一个明确动作，不是导入副作用。
     load_env_from_dotenv()
+    print(
+        "[注意] data_layer_unified_opt.py 是会触发刷新的兼容入口：本次运行会对每个注册项"
+        "真实发起采集。只读概览请使用 `rbt-fin overview --cache-root <dir>`。"
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="datasets_unified_summary.csv", help="输出 CSV 路径")
     ap.add_argument("--limit", type=int, default=300, help="从最早日期起抽取的日样本长度")
