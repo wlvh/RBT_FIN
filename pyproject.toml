@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbt-fin"
-version = "0.2.0"
+# 版本只在 `src/rbt_fin/__about__.py` 声明一次：在这里再写一遍会漂移，
+# 而漂移的表现是"源码已经是新版本、构建出来的 wheel 还是旧版本"。
+dynamic = ["version"]
 description = "统一的加密与宏观数据采集层：公共缓存/校验/内容寻址存储流程 + 分钟行情"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -42,3 +44,6 @@ addopts = "-q -m 'not realsource'"
 markers = [
     "realsource: 需要真实外部来源的测试；默认离线测试集不执行",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "rbt_fin.__about__.__version__"}

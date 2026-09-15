@@ -315,6 +315,102 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+@contextmanager
+def exclusive_lock(*, lock_path: Path, context: str, blocking: bool = True) -> Iterator[None]:
+    """
+    以旁路锁文件取得独占写权，覆盖调用方整个“读旧状态 -> 更新 -> 校验 -> 发布”周期。
+
+    为什么锁必须覆盖整个周期而不是只包住最后一次写：
+        只给写文件加锁，后到的写者仍可能拿着更旧的输入把先到者的结果盖掉——
+        `os.replace` 只保证单次替换是原子的，不提供更新过程的互斥。
+
+    为什么用旁路文件而不是锁正式文件：
+        正式文件会被 `os.replace` 换掉 inode，锁在旧 inode 上对新写者不可见。
+
+    Args:
+        lock_path: 锁文件路径；父目录不存在时会被创建。
+        context: 报错上下文（数据集 / 消费者标识）。
+        blocking: True 阻塞等待；False 抢不到立即抛 LockError。
+
+    Raises:
+        LockError: 非阻塞模式下锁被占用。
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except OSError as exc:
+            raise LockError(f"{context}: 无法获取更新锁 {lock_path}: {exc}") from exc
+        yield
+    finally:
+        # 为什么显式 unlock 再 close：close 虽会释放 flock，但显式释放让顺序在测试中可控。
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def atomic_write_bytes(
+    *,
+    target: Path,
+    payload: bytes,
+    tmp_prefix: str,
+    tmp_suffix: str,
+    context: str,
+    fsync: bool = True,
+    verify_written_hash: bool = False,
+    before_replace: Optional[Callable[[], None]] = None,
+    after_replace: Optional[Callable[[], None]] = None,
+) -> None:
+    """
+    用**独立命名**的临时文件写入字节，再原子替换到目标路径。
+
+    为什么临时文件名必须独立：
+        共用固定 `.tmp` 会让两个写者打开同一个文件——后开的那个以 "w" 直接截断先开者
+        已写好的内容，先开者随后把这个空文件 `replace` 成正式文件，**全程不抛异常**。
+        `tempfile.mkstemp` 在同目录生成唯一名字，同时保证 `os.replace` 仍在同一文件系统内。
+
+    为什么 fsync 必须在 replace 之前：
+        `replace` 只保证“读者看到的要么是旧文件要么是新文件”，不保证新文件内容已落盘。
+
+    Args:
+        target: 目标路径。
+        payload: 要写入的字节。
+        tmp_prefix / tmp_suffix: 临时文件名前后缀；建议以 '.' 开头，避免被目录扫描当成正式产物。
+        context: 报错上下文。
+        fsync: 是否 fsync 文件与目录；False 只保证可见性、不保证持久性。
+        verify_written_hash: True 时回读临时文件校验哈希，确认磁盘写入可信。
+        before_replace / after_replace: 提交点前后的同步回调，供受控中断测试精确注入。
+
+    Raises:
+        PublishError: `verify_written_hash` 开启且回读哈希与内存字节不符。
+        OSError: 写入或替换失败；失败时清理临时文件并原样上抛。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=tmp_prefix, suffix=tmp_suffix)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            if fsync:
+                os.fsync(handle.fileno())
+        if verify_written_hash and sha256_file(tmp_path) != sha256_bytes(payload):
+            raise PublishError(f"{context}: 临时文件哈希与内存字节不符，磁盘写入不可信。")
+        if before_replace is not None:
+            before_replace()
+        os.replace(str(tmp_path), str(target))
+    except BaseException:
+        # 提交前失败：旧正式状态不变；首次初始化也不留下冒充正式版本的文件。
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+    if after_replace is not None:
+        after_replace()
+    if fsync:
+        _fsync_directory(target.parent)
+
+
 class DatasetStore:
     """
     单个数据集的缓存目录读写入口。
@@ -362,18 +458,8 @@ class DatasetStore:
             LockError: 非阻塞模式下锁被占用。
         """
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
-        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
-        handle = self.lock_path.open("a+")
-        try:
-            try:
-                fcntl.flock(handle.fileno(), flags)
-            except OSError as exc:
-                raise LockError(f"{self.dataset_id}: 无法获取更新锁 {self.lock_path}: {exc}") from exc
+        with exclusive_lock(lock_path=self.lock_path, context=self.dataset_id, blocking=blocking):
             yield
-        finally:
-            # 为什么显式 unlock 再 close：close 虽会释放 flock，但显式释放让顺序在测试中可控。
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
 
     def read_manifest(self) -> Optional[Manifest]:
         """
@@ -520,29 +606,15 @@ class DatasetStore:
             共用固定 `.tmp` 会让两个写者互相踩，且中断后残留文件难以与正式文件区分。
             `tempfile.mkstemp` 在同目录生成唯一名字，保证 `os.replace` 仍在同一文件系统内。
         """
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(self.dataset_dir), prefix=f".{CONTENT_PREFIX}tmp-", suffix=CONTENT_SUFFIX
+        atomic_write_bytes(
+            target=target,
+            payload=payload,
+            tmp_prefix=f".{CONTENT_PREFIX}tmp-",
+            tmp_suffix=CONTENT_SUFFIX,
+            context=self.dataset_id,
+            fsync=fsync,
+            verify_written_hash=True,
         )
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                if fsync:
-                    os.fsync(handle.fileno())
-            written = sha256_file(tmp_path)
-            if written != sha256_bytes(payload):
-                raise PublishError(
-                    f"{self.dataset_id}: 临时内容文件哈希与内存字节不符，磁盘写入不可信。"
-                )
-            os.replace(str(tmp_path), str(target))
-            if fsync:
-                _fsync_directory(self.dataset_dir)
-        except BaseException:
-            # 提交前失败：清理临时文件，保持旧正式状态不变；首次初始化也不留下冒充正式版本的文件。
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
 
     def _replace_manifest(
         self,
@@ -558,23 +630,13 @@ class DatasetStore:
             `os.replace` 之前的任何失败都不改变旧正式状态；替换之后新状态即可见。
             替换后的 fsync 只决定“持久性是否已确认”，不改变可见性。
         """
-        payload = manifest.to_json_bytes()
-        fd, tmp_name = tempfile.mkstemp(dir=str(self.dataset_dir), prefix=".manifest-tmp-", suffix=".json")
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                if fsync:
-                    os.fsync(handle.fileno())
-            if phase_hook is not None:
-                phase_hook(PHASE_BEFORE_MANIFEST_REPLACE)
-            os.replace(str(tmp_path), str(self.manifest_path))
-        except BaseException:
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
-        if phase_hook is not None:
-            phase_hook(PHASE_AFTER_MANIFEST_REPLACE)
-        if fsync:
-            _fsync_directory(self.dataset_dir)
+        atomic_write_bytes(
+            target=self.manifest_path,
+            payload=manifest.to_json_bytes(),
+            tmp_prefix=".manifest-tmp-",
+            tmp_suffix=".json",
+            context=self.dataset_id,
+            fsync=fsync,
+            before_replace=None if phase_hook is None else (lambda: phase_hook(PHASE_BEFORE_MANIFEST_REPLACE)),
+            after_replace=None if phase_hook is None else (lambda: phase_hook(PHASE_AFTER_MANIFEST_REPLACE)),
+        )

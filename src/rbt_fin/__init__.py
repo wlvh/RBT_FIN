@@ -59,8 +59,9 @@ from .exports import ExportRecord, export_trading_csv
 from .http import HttpClient, RequestBudget, build_session
 from .pipeline import TaskOutcome, acquire_dataset, run_task
 from .registry import build_registry, get_dataset
-from .storage import DatasetStore, Manifest
+from .storage import DatasetStore, Manifest, atomic_write_bytes, exclusive_lock
 from .timeutils import complete_end_exclusive, expected_grid, require_utc
+from .validation import validate_ohlcv_values
 
 __all__ = [
     "__version__",
@@ -73,8 +74,11 @@ __all__ = [
     # 流程
     "acquire_dataset", "run_task", "TaskOutcome",
     "build_registry", "get_dataset",
-    # 存储与导出
+    # 存储与导出（`exclusive_lock` / `atomic_write_bytes` 是供外部消费者复用的写安全原语）
     "DatasetStore", "Manifest", "export_trading_csv", "ExportRecord",
+    "exclusive_lock", "atomic_write_bytes",
+    # 校验（`validate_ohlcv_values` 是不依赖 Dataset/DataRequest 的纯数值合同）
+    "validate_ohlcv_values",
     # HTTP
     "HttpClient", "RequestBudget", "build_session",
     # 时间

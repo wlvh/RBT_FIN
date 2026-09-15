@@ -7,8 +7,8 @@
 - `timeutils.py`：UTC 时间语义唯一真相源。tz-aware 校验、固定长度周期解析（周/月拒绝）、已完成周期右开边界、期望网格、网格断言（秒/微秒/纳秒三级）。
 - `contracts.py`：`Dataset` / `DataRequest` / `DataResult` / `CoverageReport` / `AcquireContext` / `AcquireResult`。刷新间隔、陈旧上限、范围/身份/质量在此分开表达。
 - `http.py`：公共下载护栏——超时、有限重试、请求预算；HTTP 状态与业务状态分别检查；会话由调用方显式构造（`build_session()`）。
-- `storage.py`：`cache/<dataset>/{data-<sha256>.csv, manifest.json, update.lock}`。内容文件永不原地修改，替换 `manifest.json` 是唯一提交点；`phase_hook` 提供受控中断同步点。
-- `validation.py`：严格网格 OHLCV 校验、非规则序列校验、严格数值解析（不使用 `coerce+dropna`）、按时间主键去重（同时间不同内容默认拒绝）。
+- `storage.py`：`cache/<dataset>/{data-<sha256>.csv, manifest.json, update.lock}`。内容文件永不原地修改，替换 `manifest.json` 是唯一提交点；`phase_hook` 提供受控中断同步点。另导出两个**供库外消费者复用**的写安全原语：`exclusive_lock()`（旁路锁文件，必须覆盖调用方整个“读旧状态 -> 更新 -> 校验 -> 发布”周期，只锁最后一次写不够）与 `atomic_write_bytes()`（`mkstemp` 独立临时名 + fsync + `os.replace`，可选回读哈希校验与提交点前后回调）。`DatasetStore` 自身的内容写入、manifest 替换与取锁都委托给这两个原语，因此库内外只有一份实现。
+- `validation.py`：严格网格 OHLCV 校验、非规则序列校验、严格数值解析（不使用 `coerce+dropna`）、按时间主键去重（同时间不同内容默认拒绝）。其中**纯数值合同**已提为公共函数 `validate_ohlcv_values(frame, context=...)`：必需列齐全、数值有限、价格为正、`high/low` 正确包住 `open/close`、`volume` 非负；它不需要 `Dataset`/`DataRequest`，因此实盘滚动窗口这类没有这两个对象的消费者可以直接复用，不必另写第二份略有差异的实现。`validate_strict_grid_ohlcv()` 内部也调用它。
 - `transforms.py`：少量显式转换——按 UTC 日期取日均 / 日内 last、保留基础值的环比（首次记录/零分母不填 0）。
 - `pipeline.py`：公共流程编排（`acquire_dataset`）与多数据集任务（`run_task`）。`last_verified_at` 只在真实来源成功解析并核验后推进。
 - `registry.py`：数据集注册表。`params` 既是 manifest 记录也是适配器真正读取的参数，不存在第二份硬编码。当前含 26 个基础数据集 + 4 个别名 = 30 个对外注册标识，**基线的 25 个 `dataset_id` 全部保留**。`DATASET_ALIASES` 让同序列的第二个注册名解析到**同一个 Dataset**，因此共用同一个缓存目录——重复的 FRED 序列不会重复下载。`list_registered_ids()` 是概览的真相源。

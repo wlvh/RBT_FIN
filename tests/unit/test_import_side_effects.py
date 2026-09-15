@@ -121,3 +121,24 @@ def test_optional_dependency_absence_does_not_block_core(tmp_path):
     report = _run_probe(tmp_path)
     assert "yfinance" not in report["modules"]
     assert report["version"]
+
+
+def test_distribution_version_matches_module_version():
+    """
+    安装后的发行版版本必须与 `rbt_fin.__version__` 一致。
+
+    为什么需要这条：版本一旦在 `pyproject.toml` 和 `__about__.py` 各写一遍就会漂移，
+    而漂移的表现是"源码已经是新版本、构建出来的 wheel 还是旧版本"——
+    跨仓库消费者拿到的证据（wheel 哈希 + 版本号）会因此指向错误的代码。
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    import rbt_fin
+
+    try:
+        installed = version("rbt-fin")
+    except PackageNotFoundError:  # 源码树直接运行（未安装）时无从比较，如实跳过而不是假装通过
+        import pytest
+
+        pytest.skip("rbt-fin 未以发行版形式安装，无法比较版本")
+    assert installed == rbt_fin.__version__

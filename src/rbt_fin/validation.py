@@ -154,6 +154,60 @@ def _classify_missing(
     return head, interior, tail, ""
 
 
+def validate_ohlcv_values(frame: pd.DataFrame, *, context: str) -> None:
+    """
+    OHLCV 的**纯数值合同**：与时间轴、覆盖率无关，任何持有 OHLCV 的路径都可直接复用。
+
+    为什么单独成函数：
+        网格 / 覆盖校验需要 `Dataset` 与 `DataRequest`，实盘滚动窗口这类消费者没有也不该有
+        这两个对象；但"价格必须为正、high/low 必须包住 open/close、成交量非负、数值必须有限"
+        对它们同样成立。把数值合同独立出来，才不会出现第二份略有差异的实现。
+
+    检查项：
+        - 必需列齐全（open/high/low/close/volume）
+        - 所有值有限（拒绝 NaN / inf）
+        - 价格为正
+        - high/low 正确包住 open/close
+        - volume 非负
+
+    Args:
+        frame: 至少包含 OHLCV 五列的数据帧；索引仅用于报错定位。
+        context: 报错上下文（数据集 / 消费者标识）。
+
+    Raises:
+        ValueContractError: 任一数值合同不成立；错误信息给出最多 5 个违约索引示例。
+    """
+    missing_columns = [col for col in OHLCV_COLUMNS if col not in frame.columns]
+    if missing_columns:
+        raise ValueContractError(f"{context}: 缺少必需 OHLCV 列 {missing_columns}。")
+
+    for column in OHLCV_COLUMNS:
+        series = frame[column]
+        if not np.isfinite(series.to_numpy(dtype="float64")).all():
+            bad = series[~np.isfinite(series.to_numpy(dtype="float64"))]
+            raise ValueContractError(
+                f"{context}: 列 {column!r} 存在非有限值，示例索引: {[str(i) for i in bad.index[:5]]}"
+            )
+    prices = frame[["open", "high", "low", "close"]].to_numpy(dtype="float64")
+    if (prices <= 0).any():
+        rows = frame.index[(prices <= 0).any(axis=1)]
+        raise ValueContractError(f"{context}: 存在非正价格，示例索引: {[str(i) for i in rows[:5]]}")
+    high = frame["high"].to_numpy(dtype="float64")
+    low = frame["low"].to_numpy(dtype="float64")
+    open_ = frame["open"].to_numpy(dtype="float64")
+    close = frame["close"].to_numpy(dtype="float64")
+    bad_range = (high < low) | (high < open_) | (high < close) | (low > open_) | (low > close)
+    if bad_range.any():
+        rows = frame.index[bad_range]
+        raise ValueContractError(
+            f"{context}: high/low 未正确包住 open/close，示例索引: {[str(i) for i in rows[:5]]}"
+        )
+    volume = frame["volume"].to_numpy(dtype="float64")
+    if (volume < 0).any():
+        rows = frame.index[volume < 0]
+        raise ValueContractError(f"{context}: 成交量为负，示例索引: {[str(i) for i in rows[:5]]}")
+
+
 def validate_strict_grid_ohlcv(
     frame: pd.DataFrame,
     *,
@@ -189,40 +243,7 @@ def validate_strict_grid_ohlcv(
     assert_on_grid(index, interval=interval, context=context)
     assert_strictly_increasing_unique(index, context=context)
 
-    missing_columns = [col for col in OHLCV_COLUMNS if col not in frame.columns]
-    if missing_columns:
-        raise ValueContractError(f"{context}: 缺少必需 OHLCV 列 {missing_columns}。")
-
-    # 数值合同：所有值必须有限；价格必须为正；high/low 必须正确包住 open/close；volume 非负。
-    for column in OHLCV_COLUMNS:
-        series = frame[column]
-        if not np.isfinite(series.to_numpy(dtype="float64")).all():
-            bad = series[~np.isfinite(series.to_numpy(dtype="float64"))]
-            raise ValueContractError(
-                f"{context}: 列 {column!r} 存在非有限值，示例索引: {[str(i) for i in bad.index[:5]]}"
-            )
-    prices = frame[["open", "high", "low", "close"]].to_numpy(dtype="float64")
-    if (prices <= 0).any():
-        rows = frame.index[(prices <= 0).any(axis=1)]
-        raise ValueContractError(
-            f"{context}: 存在非正价格，示例索引: {[str(i) for i in rows[:5]]}"
-        )
-    high = frame["high"].to_numpy(dtype="float64")
-    low = frame["low"].to_numpy(dtype="float64")
-    open_ = frame["open"].to_numpy(dtype="float64")
-    close = frame["close"].to_numpy(dtype="float64")
-    bad_range = (high < low) | (high < open_) | (high < close) | (low > open_) | (low > close)
-    if bad_range.any():
-        rows = frame.index[bad_range]
-        raise ValueContractError(
-            f"{context}: high/low 未正确包住 open/close，示例索引: {[str(i) for i in rows[:5]]}"
-        )
-    volume = frame["volume"].to_numpy(dtype="float64")
-    if (volume < 0).any():
-        rows = frame.index[volume < 0]
-        raise ValueContractError(
-            f"{context}: 成交量为负，示例索引: {[str(i) for i in rows[:5]]}"
-        )
+    validate_ohlcv_values(frame, context=context)
 
     # 覆盖只在请求范围内统计：合并了更早历史的正式数据不应因为“比请求更全”而被判违约。
     # 越界记录本身仍要被看见——单页越界由来源适配器直接 Fail Fast（见 sources/*），

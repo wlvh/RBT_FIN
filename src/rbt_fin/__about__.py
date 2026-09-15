@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # trading 兼容 CSV 的导出格式版本；与数据本身的 schema_version 是两个独立概念。
 LEGACY_CSV_FORMAT_VERSION = "legacy-ohlcv-1"
