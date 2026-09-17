@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import resource
+import sys
 import time
 from pathlib import Path
 
@@ -40,8 +41,10 @@ from rbt_fin.validation import validate_strict_grid_ohlcv
 
 
 def _peak_rss_mb() -> float:
-    """返回本进程峰值常驻内存（MB）。Linux 上 ru_maxrss 单位是 KB。"""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    """返回本进程峰值常驻内存（MB）。`ru_maxrss` 在 Linux 上是 KB，在 macOS 上是字节，必须按平台换算。"""
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+    return raw / divisor
 
 
 def _synthetic_minutes(*, start: pd.Timestamp, rows: int) -> pd.DataFrame:
