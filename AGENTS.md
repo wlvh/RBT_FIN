@@ -22,7 +22,7 @@
 - `sources/local_csv.py`：本地导入适配器。不联网、不修改用户原文件、记录源文件哈希。
 
 ### 兼容入口
-- `data_layer_unified_opt.py`：保留 `--out/--limit` 的原有用途。**会触发刷新**——每次运行对全部注册项真实采集，不是只读概览。其各来源将在 WP2 迁移到 `rbt_fin` 公共流程。已移除内置 CryptoCompare 备用 key，缺配置时 Fail Fast。
+- `data_layer_unified_opt.py`：兼容概览入口（薄包装）。保留 `--out/--limit` 与原版 10 列输出；每个注册项走 `rbt_fin.acquire_dataset` 公共流程，`--mode auto|force|offline` 显式决定是否联网；不再自带采集器/解析器（WP2 已迁入 `rbt_fin.sources`，重复实现已删除）；凭据只从进程环境/`--env-file` 收集且不写回环境；`category` 由数据身份派生、`endpoint` 记录实现该项的采集函数。由 `tests/unit/test_legacy_compat_cli.py` 守护。
 
 ### 测试
 - `tests/conftest.py`：受控 HTTP 会话 + 真实协议载荷；固定时钟与独立缓存根目录。
@@ -38,6 +38,7 @@
 - `tests/unit/test_golden_fixture_roundtrip.py`：固定 fixture → 公共流程 → golden CSV 的字节级回路（WP3 交接件）。
 - `tests/integration/test_interrupt_and_concurrency.py` + `child_worker.py`：真实子进程的提交前/提交后 SIGKILL，以及真实双写者无覆盖丢失。
 - `tests/realsource/test_real_http_qualification.py`：真实来源资格验证；默认被 `-m 'not realsource'` 排除，需显式 `pytest -m realsource`。来源因地域限制不可达时 skip 并打印证据，不伪装成通过。
+- `tests/unit/test_legacy_compat_cli.py`：兼容入口收敛合同——全部联网注册项经公共流程产出原版 10 列概览、offline+空缓存记录错误行、缓存复跑零请求、模块无重复采集器/无导入副作用、凭据收集不改环境、参数校验。
 - `tests/unit/test_full_registry.py`：全注册表参数化测试——每个注册标识都走 acquire -> persist -> load -> cache-hit（第二次请求零网络，由"一被调用就失败"的替身断言）；基线 25 个 id 保留；FRED 别名解析一致且不重复下载；缺凭据 Fail Fast；凭据值不进 params/manifest。
 - `tests/unit/test_wp2_source_protocols.py`：来源专项协议测试——Bybit `retCode`/首页不传 startTime/游标不推进；Binance K 线与资金费率的 `startTime` 分别验证（不互推）；参考价占位 volume 不外露、溢价指数可为负、指数价必须为正；低频来源的非法数值/全空响应/字段变化/缺层定位；FRED 的 `.`；环比保留基础值且未定义处不填 0；全量重取时历史缩短保留旧数据并报错。
 - `tests/fixtures/`：独立构造的协议 fixture 与 golden CSV；不含任何真实凭据。

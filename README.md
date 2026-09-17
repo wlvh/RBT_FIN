@@ -112,8 +112,11 @@ CRYPTOCOMPARE_API_KEY=... # cryptocompare_btc_chain_pct
 
 ## 兼容入口
 
-`data_layer_unified_opt.py` 保留 `--out/--limit` 的原有用途。
-**它会触发刷新**：每次运行都对全部注册项真实发起采集。只读概览请用 `rbt-fin overview`。
+`data_layer_unified_opt.py` 保留 `--out/--limit` 的原有用途与原版 10 列概览输出，但已收敛为**薄包装**：
+每个注册项都走 `rbt_fin.acquire_dataset` 公共流程（缓存资格 → 采集 → 校验 → 内容寻址发布），
+不再自带任何采集器/解析器。刷新语义由 `--mode auto|force|offline` 显式决定（默认 `auto`：缓存合格且未到
+重新检查时机则零请求）；`--start-date` 必填，`--end-date` 缺省为最新已完成 UTC 日；凭据只从进程环境与
+显式 `--env-file` 收集，不写回环境。失败行的 `na_ratio` 为空（缺失率未知）。只读概览请用 `rbt-fin overview`。
 
 ## 测试
 
