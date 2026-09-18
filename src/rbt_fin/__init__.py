@@ -46,6 +46,7 @@ from .errors import (
     OfflineUnavailableError,
     PaginationError,
     PublishError,
+    PublishedUnverifiedError,
     RbtFinError,
     ResponseSchemaError,
     RevisionConflictError,
@@ -88,5 +89,5 @@ __all__ = [
     "BusinessStatusError", "ResponseSchemaError", "PaginationError", "BudgetExhaustedError",
     "ContractError", "TimeContractError", "ValueContractError", "CoverageError",
     "RevisionConflictError", "SourceBlockedError", "StorageError", "LockError", "CacheCorruptionError",
-    "PublishError", "CacheEligibilityError", "OfflineUnavailableError", "StaleCacheError",
+    "PublishError", "PublishedUnverifiedError", "CacheEligibilityError", "OfflineUnavailableError", "StaleCacheError",
 ]

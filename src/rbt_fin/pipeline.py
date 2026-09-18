@@ -46,9 +46,11 @@ from .contracts import (
     Dataset,
 )
 from .errors import (
+    CacheCorruptionError,
     ConfigError,
     CoverageError,
     OfflineUnavailableError,
+    PublishedUnverifiedError,
     RevisionConflictError,
     StaleCacheError,
 )
@@ -143,7 +145,9 @@ def _evaluate_cache(
 
     frame = store.read_frame(manifest, verify_content=verify_content)
     # 复评时的 scan_complete 只能来自“上一次真的扫过本次请求范围”的事实。
-    inherited_scan_complete = bool(manifest.coverage.get("scan_complete", False)) and _previous_scan_covers(
+    if "scan_complete" not in manifest.coverage:
+        raise CacheCorruptionError(f"{dataset.dataset_id}: manifest.coverage 缺少 scan_complete（清单被外部改写或 schema 漂移）")
+    inherited_scan_complete = bool(manifest.coverage["scan_complete"]) and _previous_scan_covers(
         manifest=manifest, request=request
     )
     scan_note = "缓存复评（零网络请求）"
@@ -207,7 +211,9 @@ def _check_revision(
     columns = list(dataset.value_columns)
     old_values = old_window.loc[common, columns]
     new_values = acquired.loc[common, columns]
-    differs = ~(old_values.eq(new_values).all(axis=1))
+    # NaN 是合同允许的"未定义"（首行/零分母的 _pct），两边同为 NaN 不是内容变化；DataFrame.eq 会把它判成不同。
+    same = old_values.eq(new_values) | (old_values.isna() & new_values.isna())
+    differs = ~(same.all(axis=1))
     changed = int(differs.sum())
     if changed == 0:
         return 0, ""
@@ -356,7 +362,9 @@ def acquire_dataset(
                 http=http, credentials=credentials, local_inputs=local_inputs,
                 code_version=resolved_code_version, phase_hook=phase_hook,
             )
-        except Exception as exc:  # 刷新失败：是否允许降级由请求显式声明，且必须如实报告。
+        except PublishedUnverifiedError:
+            raise  # 已提交：磁盘是新状态、核对时间已推进，不能按"刷新失败、沿用旧缓存"报告
+        except Exception as exc:  # 刷新失败（提交前）：是否允许降级由请求显式声明，且必须如实报告。
             return _handle_refresh_failure(
                 dataset=dataset, request=request, store=store, state=state, error=exc
             )
@@ -450,7 +458,11 @@ def _refresh_and_publish(
         },
     )
     # 重新按 manifest 读回：证明“写下去的东西能被读回来”，而不是只信任内存对象。
-    published = store.read_frame(manifest, verify_content=True)
+    try:
+        published = store.read_frame(manifest, verify_content=True)
+    except Exception as exc:
+        # manifest 已替换（新状态可见），回读失败不是"未发布"：不能退回旧缓存假装刷新失败。
+        raise PublishedUnverifiedError(f"{dataset.dataset_id}: 已发布 {manifest.content_sha256[:12]}，但回读校验失败: {exc}") from exc
     return _build_result(
         dataset=dataset, request=request, manifest=manifest, frame=published, store=store,
         coverage=coverage, used_cache=False, refresh_failed=False,

@@ -37,6 +37,7 @@ from .timeutils import require_utc
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+EXIT_USAGE = 2
 
 
 def _parse_time(value: str, *, arg_name: str) -> pd.Timestamp:
@@ -207,6 +208,9 @@ def cmd_export_trading_csv(args: argparse.Namespace) -> int:
         print(f"[FAIL] {dataset.dataset_id}: 尚未初始化，无法导出。", file=sys.stderr)
         return EXIT_FAILED
     frame = store.read_frame(manifest, verify_content=True)
+    if "interval" not in dataset.params:
+        print(f"{dataset.dataset_id} 不是分钟/固定间隔行情数据集（params 无 interval），不支持 legacy 导出", file=sys.stderr)
+        return EXIT_USAGE
     record = export_trading_csv(
         frame=frame,
         target_path=Path(args.target),

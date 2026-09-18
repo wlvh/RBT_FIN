@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
+import re
+
 import requests
 
 from .errors import (
@@ -86,6 +88,20 @@ def build_session(*, user_agent: str = DEFAULT_USER_AGENT) -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent, "Accept": "application/json, text/plain;q=0.8"})
     return session
+
+
+_CREDENTIAL_QUERY_KEYS = ("api_key", "apikey", "api-key", "key", "token", "secret", "access_token")
+_CREDENTIAL_PATTERN = re.compile(r"(?i)\b(" + "|".join(re.escape(k) for k in _CREDENTIAL_QUERY_KEYS) + r")=([^&\s'\"]+)")
+
+
+def redact_credentials(text: str) -> str:
+    """
+    把异常/日志文本里的查询串凭据值改写为 `<redacted>`。
+
+    为什么需要：`requests`/`urllib3` 的连接类异常文本固定包含完整 URL（含 query），FRED/Glassnode 的
+    key 以查询参数发送，原样进入异常消息就会随 `DataResult.errors`、任务失败清单、概览 CSV 落盘（§2/§4 日志脱敏）。
+    """
+    return _CREDENTIAL_PATTERN.sub(lambda m: f"{m.group(1)}=<redacted>", text)
 
 
 class HttpClient:
@@ -241,7 +257,7 @@ class HttpClient:
                     self._sleep(self._budget.backoff_seconds * (attempt + 1))
                     continue
                 raise HttpStatusError(
-                    f"{context}: 网络请求失败且重试耗尽（attempts={attempt + 1}）: {exc}"
+                    f"{context}: 网络请求失败且重试耗尽（attempts={attempt + 1}）: {redact_credentials(str(exc))}"
                 ) from exc
 
             status = response.status_code

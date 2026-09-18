@@ -13,17 +13,17 @@ requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [{name = "wlvh"}]
 
-# 为什么基础依赖只有两项：
+# 为什么基础依赖只有三项：
 # - Issue #5 §7 要求“基础依赖保持小；来源可选依赖不阻止安装/使用核心行情能力”。
-# - 分钟行情（WP1 的首批生产承诺）只需要 pandas 解析/校验与 requests 取数。
+# - 分钟行情（WP1 的首批生产承诺）只需要 pandas（>=2.0：DatetimeIndex.as_unit / format="ISO8601" / lineterminator）+ numpy 解析/校验与 requests 取数。
+# - 没有任何来源需要 yfinance：不声明不存在的可选依赖。
 dependencies = [
-    "pandas>=1.3.0",
+    "pandas>=2.0.0",
+    "numpy>=1.21.0",
     "requests>=2.25.0",
 ]
 
 [project.optional-dependencies]
-# 仅个别低频来源需要；缺失时不影响核心行情能力。
-yfinance = ["yfinance>=0.2.0"]
 dev = ["pytest>=7.0.0", "build>=1.0.0"]
 
 [project.scripts]

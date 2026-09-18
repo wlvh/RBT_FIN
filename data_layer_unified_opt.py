@@ -117,16 +117,19 @@ def summarize_dataset(*, registered_id: str, dataset, frame: Optional[pd.DataFra
     if error is not None:
         remark_parts.append(f"error={error}")
     elif frame is not None and len(frame):
+        # 基线语义（sample_first_n_days + na_cells_info）：自最早日期起 limit 个自然日的日历左连接，
+        # 缺失日计为 NA；日内多条记录（资金费率 8h、1m 行情）按 UTC 日均值折成一行（基线 to_daily 的 mean 口径）。
         dates = frame.index.tz_convert("UTC").normalize()
         earliest = dates.min()
-        in_sample = dates < earliest + pd.Timedelta(days=limit)
-        values = frame.loc[in_sample, list(dataset.value_columns)]
+        daily = frame[list(dataset.value_columns)].groupby(dates).mean()
+        calendar = pd.date_range(earliest, earliest + pd.Timedelta(days=limit - 1), freq="D", tz="UTC")
+        values = daily.reindex(calendar)
         na_cells = int(values.isna().to_numpy().sum())
         row.update({
             "earliest_date": earliest.date().isoformat(),
-            "sample_start": earliest.date().isoformat(),
-            "sample_end": dates[in_sample].max().date().isoformat(),
-            "sample_rows": int(in_sample.sum()), "na_cells": na_cells,
+            "sample_start": calendar[0].date().isoformat(),
+            "sample_end": calendar[-1].date().isoformat(),
+            "sample_rows": int(len(calendar)), "na_cells": na_cells,
             "na_ratio": round(na_cells / max(values.size, 1), 6),
         })
     remark_parts.append(f"params={json.dumps(dict(dataset.params), ensure_ascii=False, sort_keys=True)}")
@@ -136,7 +139,8 @@ def summarize_dataset(*, registered_id: str, dataset, frame: Optional[pd.DataFra
 
 def run_overview(*, cache_root: Path, start: pd.Timestamp, end_exclusive: pd.Timestamp, limit: int, mode: str,
                  http_factory: Callable[[], Optional[rbt_fin.HttpClient]], credentials: Mapping[str, str],
-                 now_utc: pd.Timestamp, registered_ids: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                 now_utc: pd.Timestamp, registered_ids: Optional[Sequence[str]] = None,
+                 local_inputs: Optional[Mapping[str, Mapping[str, object]]] = None) -> pd.DataFrame:
     """
     对每个注册项执行一次公共流程采集并汇总。
 
@@ -149,6 +153,7 @@ def run_overview(*, cache_root: Path, start: pd.Timestamp, end_exclusive: pd.Tim
         credentials: 凭据映射（只含注册表声明的名字）。
         now_utc: 本次统一时钟。
         registered_ids: 限定的注册标识；None 表示全部。
+        local_inputs: 本地导入项的输入映射 `dataset_id -> {'csv_path': ...}`；未提供的本地项按 ConfigError 记为失败行。
 
     Returns:
         按 (category, dataset_id) 排序的概览 DataFrame。
@@ -166,6 +171,7 @@ def run_overview(*, cache_root: Path, start: pd.Timestamp, end_exclusive: pd.Tim
                 request=rbt_fin.DataRequest(start=start, end_exclusive=end_exclusive, mode=mode,
                                             require_full_coverage=False),
                 store_root=cache_root, now_utc=now_utc, http=http_factory(), credentials=credentials,
+                local_inputs=(local_inputs or {}).get(dataset.dataset_id, {}),
             )
             frame = result.frame
         except rbt_fin.RbtFinError as exc:
@@ -186,6 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=(rbt_fin.MODE_AUTO, rbt_fin.MODE_FORCE, rbt_fin.MODE_OFFLINE), default=rbt_fin.MODE_AUTO)
     parser.add_argument("--max-requests", type=int, default=400, help="每个数据集的请求预算")
     parser.add_argument("--env-file", default=".env", help="显式加载的 KEY=VALUE 凭据文件；不修改进程环境")
+    parser.add_argument("--local-csv", default="crypto_metrics_daily.csv",
+                        help="binance_metrics_local 的本地源文件（基线读 cwd 下同名文件）；不存在时该项记为失败行")
     return parser
 
 
@@ -195,9 +203,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("--limit 必须为正整数", file=sys.stderr)
         return EXIT_USAGE
     now_utc = pd.Timestamp.now(tz="UTC")
-    start = pd.Timestamp(args.start_date, tz="UTC")
+    try:
+        start = pd.Timestamp(args.start_date, tz="UTC")
+        end_date = pd.Timestamp(args.end_date, tz="UTC") if args.end_date else None
+    except (ValueError, TypeError) as exc:
+        print(f"日期参数不合法（期望 YYYY-MM-DD）：{exc}", file=sys.stderr)
+        return EXIT_USAGE
     # 结束日为"含"语义：右开截止取该日次日 00:00；缺省只用最新已完成 UTC 日，避免混入未收盘数据。
-    end_exclusive = (pd.Timestamp(args.end_date, tz="UTC") + pd.Timedelta(days=1)) if args.end_date else now_utc.normalize()
+    end_exclusive = (end_date + pd.Timedelta(days=1)) if end_date is not None else now_utc.normalize()
     if end_exclusive <= start:
         print(f"结束日期必须晚于起始日期：start={start.date()} end_exclusive={end_exclusive.date()}", file=sys.stderr)
         return EXIT_USAGE
@@ -209,8 +222,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return None
         return rbt_fin.HttpClient(session=rbt_fin.build_session(), budget=rbt_fin.RequestBudget(max_requests=args.max_requests))
 
+    local_csv = Path(args.local_csv)
+    local_inputs = {"binance_metrics_local": {"csv_path": local_csv}} if local_csv.exists() else {}
     frame = run_overview(cache_root=Path(args.cache_root), start=start, end_exclusive=end_exclusive, limit=args.limit,
-                         mode=args.mode, http_factory=http_factory, credentials=credentials, now_utc=now_utc)
+                         mode=args.mode, http_factory=http_factory, credentials=credentials, now_utc=now_utc,
+                         local_inputs=local_inputs)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(args.out, index=False, encoding="utf-8", lineterminator="\n")
     failures = int(frame["na_ratio"].isna().sum())

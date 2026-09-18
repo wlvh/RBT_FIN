@@ -27,7 +27,7 @@ import pandas as pd
 
 from .__about__ import LEGACY_CSV_FORMAT_VERSION
 from .errors import ConfigError, TimeContractError, ValueContractError
-from .storage import sha256_file
+from .storage import _fsync_directory, sha256_file
 from .timeutils import (
     assert_on_grid,
     assert_strictly_increasing_unique,
@@ -175,7 +175,7 @@ def export_trading_csv(
             handle.flush()
             os.fsync(handle.fileno())
         # 回读验证导出文件本身：证明写下去的字节能按 legacy 合同被读回来。
-        readback = pd.read_csv(tmp_path)  # 直接按路径解析，避免额外持有整份字节
+        readback = pd.read_csv(tmp_path, float_precision="round_trip")  # 直接按路径解析，避免额外持有整份字节；精确往返
         if list(readback.columns) != list(LEGACY_COLUMNS):
             raise TimeContractError(
                 f"export:{target_path.name}: 回读列序为 {list(readback.columns)}，"
@@ -193,6 +193,7 @@ def export_trading_csv(
                 f"export:{target_path.name}: 回读行数 {len(readback)} 与导出行数 {len(window)} 不符。"
             )
         os.replace(str(tmp_path), str(target_path))
+        _fsync_directory(target_path.parent)
     except BaseException:
         # 任何失败都不留下可被消费的半文件。
         if tmp_path.exists():

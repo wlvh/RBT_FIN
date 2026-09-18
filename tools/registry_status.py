@@ -114,7 +114,7 @@ def probe_real_source(*, registered_id: str, work_dir: Path) -> Dict[str, Any]:
             http=client,
             credentials=credentials,
         )
-    except BaseException as exc:  # noqa: BLE001 - 这里的职责就是把每种失败如实归类
+    except Exception as exc:  # noqa: BLE001 - 这里的职责就是把每种失败如实归类（KeyboardInterrupt 等不吞）
         return {**classify_failure(exc), "requests_used": client.requests_used}
     return {
         "status": "verified",

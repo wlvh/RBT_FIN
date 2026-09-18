@@ -114,7 +114,7 @@ def dedupe_by_time_primary_key(
     # 只对重复主键做内容比较，避免对全表做昂贵的分组运算。
     duplicated_part = ordered[duplicated_mask]
     grouped = duplicated_part.groupby(level=0)[list(value_columns)]
-    inconsistent = grouped.nunique().gt(1).any(axis=1)
+    inconsistent = grouped.nunique(dropna=False).gt(1).any(axis=1)   # NaN 与数值同主键也是冲突，不静默保留其一
     conflicting = inconsistent[inconsistent].index
     if len(conflicting) > 0:
         raise ContractError(

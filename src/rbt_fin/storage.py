@@ -34,7 +34,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from .errors import CacheCorruptionError, ConfigError, LockError, PublishError
+from .errors import CacheCorruptionError, ConfigError, LockError, PublishError, PublishedUnverifiedError
 from .timeutils import require_utc
 
 MANIFEST_FILENAME = "manifest.json"
@@ -133,7 +133,7 @@ def csv_bytes_to_frame(payload: bytes, *, columns: Sequence[str], time_column: s
         索引为 tz-aware UTC 时间的数据帧。
     """
     return _finalize_csv_frame(
-        pd.read_csv(BytesIO(payload)), columns=columns, time_column=time_column
+        pd.read_csv(BytesIO(payload), float_precision="round_trip"), columns=columns, time_column=time_column
     )
 
 
@@ -154,7 +154,9 @@ def csv_path_to_frame(path: Path, *, columns: Sequence[str], time_column: str) -
     Returns:
         索引为 tz-aware UTC 时间的数据帧。
     """
-    return _finalize_csv_frame(pd.read_csv(path), columns=columns, time_column=time_column)
+    # float_precision="round_trip"：写入用 repr 最短文本，默认解析器不保证逐位还原（1/12 往返后不等），
+    # 读回值再序列化会改变字节/哈希，并让"来源未变"的第二次刷新被误判为修订冲突。
+    return _finalize_csv_frame(pd.read_csv(path, float_precision="round_trip"), columns=columns, time_column=time_column)
 
 
 @dataclass(frozen=True)
@@ -405,10 +407,14 @@ def atomic_write_bytes(
         if tmp_path.exists():
             tmp_path.unlink()
         raise
-    if after_replace is not None:
-        after_replace()
-    if fsync:
-        _fsync_directory(target.parent)
+    try:
+        if after_replace is not None:
+            after_replace()
+        if fsync:
+            _fsync_directory(target.parent)
+    except BaseException as exc:
+        # 提交点之后的失败：新状态已可见，只是持久性未确认——用专门的异常类型，不让调用方误当成"未发布"。
+        raise PublishedUnverifiedError(f"{context}: 已原子替换 {target.name}，但之后的目录同步/钩子失败（持久性未确认）: {exc}") from exc
 
 
 class DatasetStore:

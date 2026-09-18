@@ -172,17 +172,15 @@ def extract_fred_observations(payload: Any, *, context: str) -> Records:
     """
     FRED：`{"observations": [{"date": "YYYY-MM-DD", "value": "数字或 '.'"}]}`。
 
-    为什么把 `.` 当成失败而不是缺失：FRED 用 `.` 表示"该发布日无值"。它是**字段缺失**，
+    为什么不把 `.` 直接丢掉：FRED 用 `.` 表示"该发布日无值"。它是**字段缺失**，
     不是记录缺失；静默丢掉这条会让"非发布日"与"有发布但无值"变得不可区分（§4.3）。
-    这里直接跳过并记入说明，由覆盖状态 `unverified` 如实表达。
+    这里把它作为 value=None 的记录交给 build_frame：不进入数据、但条数与示例日期写入采集说明。
     """
     rows = _require_list(payload, "observations", context=context)
     out: Records = []
     for position, row in enumerate(rows):
         _require_fields(row, ("date", "value"), context=context, position=position)
-        if row["value"] == ".":
-            continue
-        out.append((pd.Timestamp(row["date"], tz="UTC"), {"value": row["value"]}))
+        out.append((pd.Timestamp(row["date"], tz="UTC"), {"value": None if row["value"] == "." else row["value"]}))
     return out
 
 
@@ -267,23 +265,30 @@ def extract_stooq_csv(text: str, *, context: str) -> Records:
 
 # -------------------- 通用取数 --------------------
 
-def build_frame(records: Records, *, value_columns: Sequence[str], context: str) -> pd.DataFrame:
+def build_frame(records: Records, *, value_columns: Sequence[str], context: str) -> Tuple[pd.DataFrame, str]:
     """
     把提取结果组装成规范数据帧：严格解析数值、按时间主键去重、升序。
 
     Args:
-        records: `extract` 的返回值。
+        records: `extract` 的返回值；某字段值为 None 表示"该发布日字段缺失"（如 FRED 的 "."），
+            这类记录不进入数据帧，但条数与示例日期写入说明（§4.3 区分非发布日/记录缺失/字段缺失）。
         value_columns: 期望的输出列名（顺序即落盘列序）。
         context: 报错上下文。
 
     Returns:
-        索引为 tz-aware UTC 时间、名为 `date` 的数据帧。
+        (索引为 tz-aware UTC 时间、名为 `date` 的数据帧, 字段缺失说明（无则空串）)。
     """
+    missing_field = [stamp for stamp, values in records if any(values[name] is None for name in value_columns)]
+    records = [(stamp, values) for stamp, values in records if all(values[name] is not None for name in value_columns)]
+    dropped_note = ""
+    if missing_field:
+        dropped_note = (f"字段缺失 {len(missing_field)} 条（来源标记为无值，示例 "
+                        f"{[stamp.date().isoformat() for stamp in missing_field[:3]]}），未计入数据")
     if not records:
         return pd.DataFrame(
             {name: pd.Series(dtype="float64") for name in value_columns},
             index=pd.DatetimeIndex([], tz="UTC", name=TIME_COLUMN),
-        )
+        ), dropped_note
     index = pd.DatetimeIndex([stamp for stamp, _ in records], tz="UTC", name=TIME_COLUMN)
     data = {
         name: parse_strict_float(
@@ -293,7 +298,7 @@ def build_frame(records: Records, *, value_columns: Sequence[str], context: str)
     }
     return dedupe_by_time_primary_key(
         pd.DataFrame(data, index=index), value_columns=value_columns, context=context
-    )
+    ), dropped_note
 
 
 def acquire_daily_series(context: AcquireContext) -> AcquireResult:
@@ -348,15 +353,30 @@ def acquire_daily_series(context: AcquireContext) -> AcquireResult:
         )
         records = extractor(payload, context=dataset.dataset_id)
 
-    frame = build_frame(
+    frame, dropped_note = build_frame(
         records, value_columns=dataset.value_columns, context=dataset.dataset_id
     )
+    fetched_rows = len(frame)
+    cached = context.cached_frame
+    head_kept = 0
+    # 来源声明了滑动窗口（query 带非零 limit，如 CryptoCompare limit=2000）时，窗口每次前移都是"有解释的缩短"：
+    # 把缓存里早于本次来源最早记录的头部历史保留下来（§2 不裁掉已有更早合格历史）。
+    # 来源返回区间**之内**消失的既有记录不在这里补回——那是无解释的消失，交给公共流程的修订检查报错（§3）。
+    sliding_window = "limit" in params["query"] and bool(params["query"]["limit"])
+    if sliding_window and cached is not None and len(cached) and len(frame):
+        head = cached.loc[cached.index < frame.index.min(), list(dataset.value_columns)]
+        head_kept = len(head)
+        if head_kept:
+            frame = pd.concat([head, frame]).sort_index()
+    notes = [f"单次请求取回 {fetched_rows} 条记录" + (f"，保留来源窗口之前的已缓存历史 {head_kept} 条" if head_kept else "")]
+    if dropped_note:
+        notes.append(dropped_note)
     return AcquireResult(
         frame=frame,
         # 单次请求取回整段序列：这次响应覆盖了来源当前愿意给的全部历史。
         # 但来源的发布日历未经验证，因此覆盖状态仍由 `calendar_verified` 决定。
         scan_complete=True,
-        scan_note=f"单次请求全量取回 {len(frame)} 条记录",
+        scan_note=" | ".join(notes),
         requests_used=context.http.requests_used - before,
     )
 
@@ -386,10 +406,11 @@ def acquire_cryptocompare_chain_pct(context: AcquireContext) -> AcquireResult:
     base_columns = [name for name in dataset.value_columns if not name.endswith(PCT_SUFFIX)]
     # 先按基础列走通用取数，再在其上派生环比，保证两者来自同一次响应。
     base_dataset = _replace_value_columns(dataset, base_columns)
+    cached_base = None if context.cached_frame is None else context.cached_frame[base_columns]
     base_result = acquire_daily_series(
         AcquireContext(
             dataset=base_dataset, request=context.request, now_utc=context.now_utc,
-            http=context.http, cached_frame=None, credentials=context.credentials,
+            http=context.http, cached_frame=cached_base, credentials=context.credentials,
             local_inputs=context.local_inputs, force_refresh=context.force_refresh,
         )
     )

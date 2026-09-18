@@ -91,7 +91,7 @@ def test_atomic_write_detects_untrusted_disk_write(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
-def _legacy_writer_a(target: str, a_wrote, b_opened, out: str) -> None:
+def _legacy_writer_a(target: str, a_wrote, b_opened, a_replaced, out: str) -> None:
     """反例写者 A：照搬"固定 .tmp"的语句序，写完内容后等 B 打开同一个临时文件再提交。"""
     temp = Path(target + ".tmp")
     handle = open(temp, "wb")
@@ -103,15 +103,17 @@ def _legacy_writer_a(target: str, a_wrote, b_opened, out: str) -> None:
     os.replace(temp, Path(target))
     handle.close()
     Path(out).write_text("A 自认发布成功", encoding="utf-8")
+    a_replaced.set()
 
 
-def _legacy_writer_b(target: str, a_wrote, b_opened, out: str) -> None:
+def _legacy_writer_b(target: str, a_wrote, b_opened, a_replaced, stage_one_checked, out: str) -> None:
     """反例写者 B：在 A 写完之后才打开同一个固定临时文件——"wb" 会直接截断 A 的内容。"""
     temp = Path(target + ".tmp")
     a_wrote.wait(5)
     handle = open(temp, "wb")
     b_opened.set()
-    time.sleep(0.4)  # 让 A 先完成 replace
+    a_replaced.wait(5)          # 由 Event 确定 A 已完成 replace
+    stage_one_checked.wait(5)   # 主进程核对完"正式文件为空"后 B 才继续写，不靠 sleep
     try:
         handle.write(b"BBBB"); handle.flush(); os.fsync(handle.fileno())
         os.replace(temp, Path(target)); handle.close()
@@ -128,10 +130,10 @@ def test_shared_temp_name_corrupts_published_file_but_primitive_does_not(tmp_pat
     有了它，这条安全属性才是被证明过的。时序由 Event 确定，不靠 sleep 猜。
     """
     target = tmp_path / "shared.bin"
-    a_wrote, b_opened = mp.Event(), mp.Event()
+    a_wrote, b_opened, a_replaced, stage_one_checked = mp.Event(), mp.Event(), mp.Event(), mp.Event()
     ra, rb = tmp_path / "a.txt", tmp_path / "b.txt"
-    pa = mp.Process(target=_legacy_writer_a, args=(str(target), a_wrote, b_opened, str(ra)))
-    pb = mp.Process(target=_legacy_writer_b, args=(str(target), a_wrote, b_opened, str(rb)))
+    pa = mp.Process(target=_legacy_writer_a, args=(str(target), a_wrote, b_opened, a_replaced, str(ra)))
+    pb = mp.Process(target=_legacy_writer_b, args=(str(target), a_wrote, b_opened, a_replaced, stage_one_checked, str(rb)))
     pa.start(); pb.start()
     pa.join(10)
     # 阶段一：A 自认发布成功，但 B 的 "wb" 已经把它的内容截掉了，读者此刻看到空文件。
@@ -140,6 +142,7 @@ def test_shared_temp_name_corrupts_published_file_but_primitive_does_not(tmp_pat
         f"固定 .tmp 的反例未复现阶段一（正式文件 {target.read_bytes()!r}）；"
         "若本断言失败说明复现条件变了，需要重新设计反例而不是删掉它。"
     )
+    stage_one_checked.set()
     pb.join(10)
     # 阶段二：B 的 fd 指向的正是那个已被 rename 成正式文件的 inode，
     # 于是它继续往"已发布的文件"里写，而 A 从未同意过这次改动；B 自己的 replace 则找不到源。

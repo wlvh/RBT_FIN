@@ -9,7 +9,7 @@
 
 调用关系：
     `rbt_fin.registry.build_local_csv_dataset()` 绑定本模块的 `acquire_local_csv`；
-    源文件哈希写入 manifest 的 `extra.source_file_sha256`，作为本地导入的可追溯证据。
+    源文件哈希写入采集说明（manifest 的 `extra.scan_note`：`source_file_sha256=…`），作为本地导入的可追溯证据。
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def read_local_csv(
     """
     if not path.exists():
         raise ConfigError(f"{context}: 本地导入文件不存在: {path}")
-    frame = pd.read_csv(path)
+    frame = pd.read_csv(path, float_precision="round_trip")
     missing = [col for col in (time_column, *value_columns) if col not in frame.columns]
     if missing:
         raise ResponseSchemaError(

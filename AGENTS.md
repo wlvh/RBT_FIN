@@ -18,11 +18,11 @@
 - `sources/binance_funding.py`：资金费率适配器。每页保持固定 `endTime`、先落原始结算记录再聚合、`startTime` 恒为正值（不使用 `0` 哨兵）。
 - `sources/binance_reference_price.py`：Binance 三类参考价格（指数价 / 标记价 / 溢价指数）日频适配器。与 K 线共用分页路径，但**只保留 close**——这些端点的 `volume` 恒为占位 `"0"`，不是成交量；溢价指数可以为负，因此走单值网格校验而不是"价格必须为正"。
 - `sources/bybit_funding.py`：Bybit V5 资金费率适配器。`retCode != 0` 立即失败（基线只取 `result.list`，业务错误会伪装成"没有数据"）；首页不传 `startTime`、只带固定 `endTime`，随后向历史翻页；先落原始结算记录再聚合。
-- `sources/daily_series.py`：单次请求型日频序列的**唯一**通用取数路径，各来源只提供一个很小的 `extract` 函数（形状取自实测响应）。覆盖 Blockchain.com / Fear&Greed / Wikipedia / DefiLlama / FRED / Stooq / Glassnode / CryptoCompare。凭据只在发请求时合入，永不进入 `params` / manifest / 日志；Stooq 的 HTTP 200 + 反爬 HTML 页与"CSV 列名漂移"是两种不同错误。
+- `sources/daily_series.py`：单次请求型日频序列的**唯一**通用取数路径，各来源只提供一个很小的 `extract` 函数（形状取自实测响应）。覆盖 Blockchain.com / Fear&Greed / Wikipedia / DefiLlama / FRED / Stooq / Glassnode / CryptoCompare。凭据只在发请求时合入，永不进入 `params` / manifest / 日志；连接类异常文本里的查询串凭据由 `http.redact_credentials` 改写为 `<redacted>`（urllib3 的 MaxRetryError 含完整 URL）。来源声明滑动窗口（query 带非零 `limit`，如 CryptoCompare 2000）时，缓存里早于本次来源最早记录的头部历史被保留（窗口前移是有解释的缩短）；来源返回区间之内消失的既有记录仍交给修订检查报错。FRED 的 `.` 作为 value=None 记录交给 `build_frame`：不进入数据、条数与日期写入采集说明。Stooq 的 HTTP 200 + 反爬 HTML 页与"CSV 列名漂移"是两种不同错误。
 - `sources/local_csv.py`：本地导入适配器。不联网、不修改用户原文件、记录源文件哈希。
 
 ### 兼容入口
-- `data_layer_unified_opt.py`：兼容概览入口（薄包装）。保留 `--out/--limit` 与原版 10 列输出；每个注册项走 `rbt_fin.acquire_dataset` 公共流程，`--mode auto|force|offline` 显式决定是否联网；不再自带采集器/解析器（WP2 已迁入 `rbt_fin.sources`，重复实现已删除）；凭据只从进程环境/`--env-file` 收集且不写回环境；`category` 由数据身份派生、`endpoint` 记录实现该项的采集函数。由 `tests/unit/test_legacy_compat_cli.py` 守护。
+- `data_layer_unified_opt.py`：兼容概览入口（薄包装）。保留 `--out/--limit` 与原版 10 列输出；每个注册项走 `rbt_fin.acquire_dataset` 公共流程，`--mode auto|force|offline` 显式决定是否联网；不再自带采集器/解析器（WP2 已迁入 `rbt_fin.sources`，重复实现已删除）；凭据只从进程环境/`--env-file` 收集且不写回环境；`category` 由数据身份派生、`endpoint` 记录实现该项的采集函数。`--limit` 抽样沿用基线语义：自最早日期起 limit 个自然日的日历左连接（缺失日计 NA），日内多条按 UTC 日均值折成一行；`--local-csv`（默认 cwd 的 `crypto_metrics_daily.csv`）为 `binance_metrics_local` 提供输入，缺文件则记为失败行；legacy 资金费率 id 是原始结算记录的别名（日均视图为 `binance_funding.funding_daily_mean` / `transforms.daily_mean_by_utc_date`，不再自动折日）；默认 `--max-requests 400` 只够约 416 天 1m 行情，更长区间需显式提高预算。由 `tests/unit/test_legacy_compat_cli.py` 与 `tests/unit/test_self_review_findings.py` 守护。
 
 ### 测试
 - `tests/conftest.py`：受控 HTTP 会话 + 真实协议载荷；固定时钟与独立缓存根目录。
@@ -35,11 +35,12 @@
 - `tests/unit/test_revision_and_local.py`：同主键相同/不同内容、历史缩短、零分母不填零、本地导入、低频非网格。
 - `tests/unit/test_export_trading_csv.py`：legacy CSV 合同与导出文件自身哈希。
 - `tests/unit/test_import_side_effects.py`：导入无副作用、无反向依赖。
+- `tests/unit/test_self_review_findings.py`：执行者自审（2026-09-19）反例与覆盖补测——存储往返精确（`float_precision="round_trip"`）、凭据脱敏、NaN 修订比对、滑动窗口头部历史保留、窄窗口不裁历史、真正修订仍拒绝、提交后失败为 `PublishedUnverifiedError`、兼容入口本地项与 `--limit` 基线语义、同主键 NaN/数值冲突、FRED `.` 计入说明、PIT 拒绝、CryptoCompare 业务错误、真实重叠分页去重、两处资金费率游标不推进、日内 last 乱序拒绝。
 - `tests/unit/test_golden_fixture_roundtrip.py`：固定 fixture → 公共流程 → golden CSV 的字节级回路（WP3 交接件）。
 - `tests/integration/test_interrupt_and_concurrency.py` + `child_worker.py`：真实子进程的提交前/提交后 SIGKILL，以及真实双写者无覆盖丢失。
 - `tests/realsource/test_real_http_qualification.py`：真实来源资格验证；默认被 `-m 'not realsource'` 排除，需显式 `pytest -m realsource`。来源因地域限制不可达时 skip 并打印证据，不伪装成通过。
 - `tests/unit/test_legacy_compat_cli.py`：兼容入口收敛合同——全部联网注册项经公共流程产出原版 10 列概览、offline+空缓存记录错误行、缓存复跑零请求、模块无重复采集器/无导入副作用、凭据收集不改环境、参数校验。
-- `tests/unit/test_full_registry.py`：全注册表参数化测试——每个注册标识都走 acquire -> persist -> load -> cache-hit（第二次请求零网络，由"一被调用就失败"的替身断言）；基线 25 个 id 保留；FRED 别名解析一致且不重复下载；缺凭据 Fail Fast；凭据值不进 params/manifest。
+- `tests/unit/test_full_registry.py`：全注册表参数化测试——每个注册标识都走 acquire -> persist -> load -> cache-hit（第二次请求以 offline 模式、`http=None` 复读，零网络；FRED 别名用例另用一被调用就失败的替身）；基线 25 个 id 保留；FRED 别名解析一致且不重复下载；缺凭据 Fail Fast；凭据值不进 params/manifest。
 - `tests/unit/test_wp2_source_protocols.py`：来源专项协议测试——Bybit `retCode`/首页不传 startTime/游标不推进；Binance K 线与资金费率的 `startTime` 分别验证（不互推）；参考价占位 volume 不外露、溢价指数可为负、指数价必须为正；低频来源的非法数值/全空响应/字段变化/缺层定位；FRED 的 `.`；环比保留基础值且未定义处不填 0；全量重取时历史缩短保留旧数据并报错。
 - `tests/fixtures/`：独立构造的协议 fixture 与 golden CSV；不含任何真实凭据。
 
@@ -58,10 +59,11 @@ python -m pytest -m realsource     # 需要真实来源，默认不执行
 2. 公共范围统一 `[start, end_exclusive)`；各端点适配器自行转换为它的参数语义。
 3. 刷新间隔（何时再查来源）、陈旧上限（刷新失败后能否用旧数据）、范围/身份/质量分别判定。
 4. `last_verified_at` 只在真实来源结果成功解析并按合同核验后推进。
-5. 提交前任何失败都不改变旧正式状态；替换 `manifest.json` 是唯一提交点。
+5. 提交前任何失败都不改变旧正式状态；替换 `manifest.json` 是唯一提交点；替换之后的目录同步/回读失败抛 `PublishedUnverifiedError`（新状态已可见、持久性未确认），不按"刷新失败、沿用旧缓存"报告。
 6. 提前空页、预算耗尽只证明“本次扫描未完成”，不构成完整性证据。
 7. 不反向依赖 trading / Optuna / 回测引擎。
-8. 凭据只来自显式配置，代码中没有内置备用 key，其值不进入 params / manifest / 日志 / 异常信息。
+8. 凭据只来自显式配置，代码中没有内置备用 key，其值不进入 params / manifest / 日志 / 异常信息（含连接类异常文本中的 URL 查询串）。
+9. 存储层写入（repr 最短文本）与读回（round_trip 解析）互逆：同样的数据 -> 同样的字节 -> 同样的内容哈希。
 
 ## 代码规范
 0. What I cannot create, I do not understand.

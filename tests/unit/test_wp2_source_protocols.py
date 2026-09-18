@@ -283,15 +283,18 @@ def test_defillama_nested_value_must_contain_pegged_usd():
 
 def test_fred_dot_value_is_skipped_not_zeroed():
     """
-    FRED 用 `.` 表示"该发布日无值"。它必须被显式跳过，
-    绝不能被当成 0 参与后续计算。
+    FRED 用 `.` 表示"该发布日无值"。它绝不能被当成 0 参与后续计算：提取层把它作为 value=None 的记录交出，
+    build_frame 不让它进入数据、但把条数与日期写入采集说明（自审 R-14：不再静默跳过）。
     """
+    from rbt_fin.sources.daily_series import build_frame
     records = extract_fred_observations(
         {"observations": [{"date": "2026-01-01", "value": "1.5"},
                           {"date": "2026-01-02", "value": "."}]},
         context="t",
     )
-    assert len(records) == 1
+    assert [values["value"] for _, values in records] == ["1.5", None]
+    frame, note = build_frame(records, value_columns=("value",), context="t")
+    assert len(frame) == 1 and frame["value"].iloc[0] == 1.5 and "字段缺失 1 条" in note and "2026-01-02" in note
     assert records[0][1]["value"] == "1.5"
 
 

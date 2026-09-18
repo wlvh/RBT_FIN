@@ -111,18 +111,6 @@ def test_no_reverse_dependency_on_trading_or_optimizer(tmp_path):
     leaked = forbidden.intersection(report["modules"])
     assert leaked == set(), f"检测到反向/重量级依赖: {sorted(leaked)}"
 
-
-def test_optional_dependency_absence_does_not_block_core(tmp_path):
-    """
-    来源可选依赖缺失不阻止安装/使用核心行情能力。
-
-    断言方式：核心模块导入后，可选依赖（yfinance）并不在已加载模块中。
-    """
-    report = _run_probe(tmp_path)
-    assert "yfinance" not in report["modules"]
-    assert report["version"]
-
-
 def test_distribution_version_matches_module_version():
     """
     安装后的发行版版本必须与 `rbt_fin.__version__` 一致。

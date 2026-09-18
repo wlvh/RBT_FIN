@@ -97,6 +97,13 @@ class CacheCorruptionError(StorageError):
     """manifest 与内容文件不匹配，或内容文件哈希与文件名/manifest 声明不一致。"""
 
 
+class PublishedUnverifiedError(StorageError):
+    """
+    正式状态已提交（manifest 已原子替换、对读者可见），但之后的目录同步或回读校验失败：
+    不能当作"刷新失败、旧缓存仍有效"处理——磁盘上已是新内容，核对时间已推进；调用方必须把它与提交前失败区分。
+    """
+
+
 class PublishError(StorageError):
     """内容文件写入、manifest 写入或原子替换失败。"""
 
