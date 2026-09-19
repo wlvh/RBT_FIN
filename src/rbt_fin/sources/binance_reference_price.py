@@ -27,6 +27,7 @@ from typing import List
 
 import pandas as pd
 
+from ..ratelimit import ensure_binance_futures_limit_discovered
 from ..contracts import AcquireContext, AcquireResult
 from ..errors import ConfigError
 from ..timeutils import expected_grid, parse_interval
@@ -74,6 +75,8 @@ def acquire_reference_price(context: AcquireContext) -> AcquireResult:
             f"{dataset.dataset_id}: 缓存未覆盖请求范围且未提供 HTTP 客户端，无法采集。"
         )
 
+    # 只有确实要联网时才读一次实际限额（每个进程一次，1 权重）。
+    ensure_binance_futures_limit_discovered(context.http)
     before = context.http.requests_used
     fetched: List[pd.DataFrame] = []
     scan_complete = True

@@ -450,6 +450,8 @@ def _refresh_and_publish(
                 "requests_used": int(acquired.requests_used),
                 "revision_changed_rows": int(revision_changed),
                 "scan_note": acquired.scan_note,
+                # 限速证据：客户端生命周期累计（排程/冷却/退避等待秒数、限流响应数、各桶账本）。
+                "http_stats": None if http is None else http.stats,
             },
         },
     )

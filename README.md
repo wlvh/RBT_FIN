@@ -18,7 +18,7 @@
 ## 安装
 
 ```bash
-pip install rbt_fin-0.3.2-py3-none-any.whl
+pip install rbt_fin-0.3.3-py3-none-any.whl
 ```
 
 基础依赖只有 `pandas>=2.0`、`numpy` 与 `requests`；包内没有任何来源需要可选依赖（原 `yfinance` 声明已删除，该来源按 #5 §1 不接入）。
@@ -85,6 +85,19 @@ rbt-fin export-trading-csv --cache-root <dir> --dataset btcusdt_perp_1m \
 ```
 
 时间参数必须带时区；naive 值会被拒绝。
+
+## 主动限速（0.3.3 起）
+
+`HttpClient` 在每次发送前经进程共享的 `RateLimitRegistry` 排程（`rbt_fin.ratelimit`）：
+
+- 权重表来自官方文档并已用真实响应头核对（期货 K 线族按 `limit` 分档：`[1,100)`→1、`[100,500)`→2、`[500,1000]`→5、`>1000`→10；`fundingRate` 走独立的 500/5min 桶；`exchangeInfo` 1）。Binance host 上未登记权重的端点直接 `ConfigError`，不按猜测发送；非 Binance 来源不做权重限速。
+- 本进程每个窗口只用限额的 `RateLimitConfig.max_share`（默认 0.5，与旧实现每页 `sleep 0.3s` 的节奏量级相当），额度耗尽等到下一分钟窗口；成功请求与重试同样计费；`X-MBX-USED-WEIGHT-1M` 只向上校正本地账本。
+- `discover_binance_futures_limit(http)` 读取真实 `exchangeInfo.rateLimits` 刷新限额（1 权重）；文档示例值不是永久配置。
+- HTTP 429：遵守 `Retry-After`（超过 `cooldown_max_seconds=180` 即失败），缺失时保守等到下一窗口；HTTP 418：`SourceBannedError` 立即失败，不重试、不换出口。
+- `RequestBudget.max_total_wait_seconds`（默认 3600）限制排程 + 冷却 + 退避的总等待；耗尽 `BudgetExhaustedError`，不返回部分数据。
+- 默认 K 线单页 `limit=1000`：每权重取得 200 根（1500 档 150 根、499 档 249.5 根）；`limit` 不参与缓存身份。
+- `HttpClient.stats` 把请求数、三类等待秒数、限流响应数与各桶账本分开报告，并写入 manifest `extra.http_stats`。
+- 不能保证：限额按 IP 统计，同一出口其他进程/程序的用量本库看不到；本库不是跨进程/跨机分布式限流器。
 
 ## 存储布局
 

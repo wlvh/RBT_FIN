@@ -60,7 +60,7 @@ def build_klines_dataset(
     market: str = "usdm_futures",
     symbol: str = "BTCUSDT",
     interval: str = "1m",
-    limit: int = 1500,
+    limit: int = 1000,
     refresh_interval: dt.timedelta = dt.timedelta(minutes=1),
 ) -> Dataset:
     """
@@ -71,7 +71,13 @@ def build_klines_dataset(
         market: `sources.binance_klines.KLINES_ENDPOINTS` 的键。
         symbol: 交易对。
         interval: 固定长度周期。
-        limit: 单页条数。
+        limit: 单页条数。默认 1000 而不是端点上限 1500：期货 K 线权重按 LIMIT 分档
+               （[500,1000] 权重 5；>1000 权重 10），每权重取得的 K 线数 1000 档为 200 根、
+               1500 档为 150 根、499 档为 249.5 根。在本进程只用限额一半（`RateLimitConfig.max_share`
+               = 0.5，每分钟 1200 权重）且往返延迟约 0.2s 的假设下，280 万根冷启动：
+               1500 档受权重约束 ≈ 15.5 分钟，1000 档 ≈ 11.6 分钟，499 档受请求次数约束 ≈ 18.6 分钟；
+               1000 是三者中有依据的均衡点（分析见 trading#105 E2E 修订报告）。
+               `limit` 不参与缓存身份，改动不会使既有缓存失效，也不改变同一截止内的数据结果。
         refresh_interval: 默认重新检查来源的间隔。分钟行情的尾部会持续增长，
                           因此间隔设为一个 bar；真正决定是否联网的仍是“覆盖是否满足请求”。
 
@@ -247,10 +253,13 @@ def build_local_csv_dataset(
 
 def build_reference_price_dataset(
     *, dataset_id: str, market: str, symbol: str, value_column: str, require_positive: bool,
-    remark: str, interval: str = "1d", limit: int = 1500,
+    remark: str, interval: str = "1d", limit: int = 1000,
 ) -> Dataset:
     """
     构造 Binance 参考价格日频数据集（指数价 / 标记价 / 溢价指数）。
+
+    `limit` 默认 1000：与成交价 K 线同一权重分档（>1000 权重翻倍）；日频全历史约 2000 行，
+    1000 档 2 页 × 权重 5 = 10，1500 档 2 页 × 权重 10 = 20。
 
     Args:
         dataset_id: 稳定标识。

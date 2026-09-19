@@ -36,6 +36,7 @@ from ..timeutils import (
     require_utc,
     to_epoch_ms,
 )
+from ..ratelimit import FUTURES_HOST, ensure_binance_futures_limit_discovered
 from ..validation import dedupe_by_time_primary_key, parse_strict_float
 
 # 市场 -> 端点。分钟行情的首批生产承诺是 USDⓈ-M 期货成交价（trading 当前所用）。
@@ -321,6 +322,9 @@ def acquire_klines(context: AcquireContext) -> AcquireResult:
             f"{dataset.dataset_id}: 缓存未覆盖请求范围且未提供 HTTP 客户端，无法采集。"
         )
 
+    # 只有确实要联网时才读一次实际限额（每个进程一次，1 权重）；缓存已满足时上面已零请求返回。
+    if KLINES_ENDPOINTS[market].startswith(f"https://{FUTURES_HOST}/"):
+        ensure_binance_futures_limit_discovered(context.http)
     before = context.http.requests_used
     fetched: List[pd.DataFrame] = []
     scan_complete = True

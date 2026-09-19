@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ..ratelimit import ensure_binance_futures_limit_discovered
 from ..contracts import AcquireContext, AcquireResult
 from ..errors import (
     BusinessStatusError,
@@ -268,6 +269,8 @@ def acquire_funding_records(context: AcquireContext) -> AcquireResult:
         raise ConfigError(
             f"{dataset.dataset_id}: 缓存未覆盖请求范围且未提供 HTTP 客户端，无法采集。"
         )
+    # 只有确实要联网时才读一次实际限额（每个进程一次，1 权重）。
+    ensure_binance_futures_limit_discovered(context.http)
     before = context.http.requests_used
     fetched, scan_complete, scan_note = fetch_funding_records(
         http=context.http,

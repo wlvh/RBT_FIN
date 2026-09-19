@@ -36,6 +36,15 @@ class HttpStatusError(AcquisitionError):
     """HTTP 层面失败（非 2xx），包含重试耗尽后的最终失败。"""
 
 
+class SourceBannedError(HttpStatusError):
+    """
+    来源返回 418：本出口已被封禁（Binance 对持续超限的 IP 返回 418 并附 Retry-After）。
+
+    为什么单独成类型：封禁不是"再等 1.5 秒重试"能解决的临时故障；调用方必须立即停止，
+    不换 IP、不换 key、不绕封禁，由操作员按 Retry-After 处理。
+    """
+
+
 class BusinessStatusError(AcquisitionError):
     """HTTP 200 但载荷内的业务状态表示失败（例如 Bybit `retCode != 0`）。"""
 

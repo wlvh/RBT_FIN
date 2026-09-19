@@ -44,6 +44,8 @@ class _FakeResponse:
         self.status_code = 200
         self._payload = payload
         self.text = json.dumps(payload)
+        # 真实 requests.Response 总有 headers；限速层读取 X-MBX-USED-WEIGHT-1M（缺失即不校正）。
+        self.headers = {}
 
     def json(self):
         return self._payload
@@ -66,6 +68,11 @@ class _FakeSession:
 
     def get(self, url, params=None, headers=None, timeout=None):
         params = dict(params or {})
+        if url.endswith("/fapi/v1/exchangeInfo"):
+            # 0.3.3 起适配器在第一次联网取数前读一次实际限额：回真实形状的最小 rateLimits 载荷。
+            return _FakeResponse({"rateLimits": [
+                {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400},
+            ]})
         start_ms = params["startTime"]
         end_ms = params["endTime"]
         wanted = [row for row in self._rows if start_ms <= row[0] <= end_ms]

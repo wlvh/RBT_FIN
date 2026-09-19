@@ -9,6 +9,11 @@
     本模块只负责“单次请求的可靠性与预算”，分页边界由各来源适配器负责
     （`rbt_fin.sources.*`），因为不同端点的游标语义无法互相推导。
 
+    主动限速（trading#105 E2E 修订）：每次发送前经 `rbt_fin.ratelimit.RateLimitRegistry`
+    按 host/端点/LIMIT 权重排程（成功请求与重试同样计费），收到响应后用已用权重响应头
+    校正账本；429 遵守有界 `Retry-After`，418 立即按封禁失败。默认使用进程共享 registry，
+    同一进程内多个客户端/数据集共用同一份额度。
+
 调用关系：
     - 调用方用 `build_session()` 显式构造 `requests.Session`（import 本模块不会建连接）。
     - `HttpClient.get_json()` 被 `rbt_fin.sources.*` 使用。
@@ -33,10 +38,13 @@ from .errors import (
     HttpStatusError,
     ResponseSchemaError,
 )
+from .ratelimit import RateLimitRegistry, shared_registry
 
-# 可重试状态：限流（429/418）与网关/服务端临时故障。
+# 可重试状态：网关/服务端临时故障。限流 429 与封禁 418 不在这里：它们由
+# `RateLimitRegistry.penalty()` 分别按 Retry-After 冷却 / 立即失败处理，不能按普通短暂故障等 1.5s 重试。
 # 为什么不含 4xx 其余状态：参数错误、鉴权失败重试只会掩盖问题并触发更严格的封禁。
-RETRYABLE_STATUS = frozenset({418, 429, 500, 502, 503, 504, 520, 521, 522, 524})
+RETRYABLE_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 524})
+RATE_LIMITED_STATUS = frozenset({418, 429})
 
 DEFAULT_USER_AGENT = "rbt-fin/0.1 (+research)"
 
@@ -52,6 +60,11 @@ class RequestBudget:
         connect_timeout: 连接超时秒数。
         read_timeout: 读取超时秒数。
         backoff_seconds: 重试基础退避秒数；第 i 次重试等待 backoff_seconds * (i + 1)。
+        max_total_wait_seconds: 本客户端生命周期内允许的总等待秒数（限速排程 + 冷却 + 退避）；
+                                耗尽即 `BudgetExhaustedError`，不返回部分数据冒充完整。
+                                默认 3600s：按期货 K 线 limit=1000（权重 5）与 max_share=0.5
+                                （每分钟 1200 权重）估算，一次约 280 万根 1m K 线的冷启动需要
+                                ≈ 2790 页 × 5 / 1200 ≈ 11.6 分钟的排程等待，留有余量。
     """
 
     max_requests: int = 400
@@ -59,13 +72,14 @@ class RequestBudget:
     connect_timeout: float = 5.0
     read_timeout: float = 30.0
     backoff_seconds: float = 1.5
+    max_total_wait_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
         if self.max_requests <= 0:
             raise ConfigError("max_requests 必须为正整数。")
         if self.max_retries < 0:
             raise ConfigError("max_retries 不能为负。")
-        for name in ("connect_timeout", "read_timeout", "backoff_seconds"):
+        for name in ("connect_timeout", "read_timeout", "backoff_seconds", "max_total_wait_seconds"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or value < 0:
                 raise ConfigError(f"{name} 必须是非负数，实际为 {value!r}")
@@ -119,19 +133,29 @@ class HttpClient:
         session: requests.Session,
         budget: RequestBudget,
         sleep: Callable[[float], None] = time.sleep,
+        rate_limit: Optional[RateLimitRegistry] = None,
     ) -> None:
         """
         Args:
             session: 由调用方显式构造的 `requests.Session`。
             budget: 请求预算与超时配置。
-            sleep: 退避实现；测试可注入无副作用实现以避免真实等待。
+            sleep: 退避/冷却等待实现；测试可注入无副作用实现以避免真实等待。
+            rate_limit: 限速 registry；默认进程共享 registry（同一进程内所有客户端共用额度）。
+                        测试可注入带虚拟时钟的 registry。
         """
         if not isinstance(budget, RequestBudget):
             raise ConfigError(f"budget 必须是 RequestBudget，实际为 {type(budget)!r}")
+        if rate_limit is not None and not isinstance(rate_limit, RateLimitRegistry):
+            raise ConfigError(f"rate_limit 必须是 RateLimitRegistry，实际为 {type(rate_limit)!r}")
         self._session = session
         self._budget = budget
         self._sleep = sleep
+        self._rate_limit = rate_limit if rate_limit is not None else shared_registry()
         self._requests_used = 0
+        self._throttle_wait_seconds = 0.0
+        self._cooldown_wait_seconds = 0.0
+        self._backoff_wait_seconds = 0.0
+        self._rate_limited_responses = 0
 
     @property
     def requests_used(self) -> int:
@@ -142,6 +166,45 @@ class HttpClient:
     def requests_remaining(self) -> int:
         """剩余可用请求数。"""
         return self._budget.max_requests - self._requests_used
+
+    @property
+    def budget(self) -> RequestBudget:
+        """本客户端的请求/等待预算（只读）。"""
+        return self._budget
+
+    @property
+    def rate_limit(self) -> RateLimitRegistry:
+        """本客户端使用的限速 registry（用于发现实际限额与证据快照）。"""
+        return self._rate_limit
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """
+        证据统计：请求数、三类等待秒数（排程/冷却/退避）、限流响应次数与各桶账本快照。
+
+        为什么分开三类等待：报告必须区分“主动限速等待”“服务端要求的冷却”与“故障退避”，
+        不能把它们混成一个墙钟数字。
+        """
+        return {
+            "requests_used": self._requests_used,
+            "throttle_wait_seconds": self._throttle_wait_seconds,
+            "cooldown_wait_seconds": self._cooldown_wait_seconds,
+            "backoff_wait_seconds": self._backoff_wait_seconds,
+            "rate_limited_responses": self._rate_limited_responses,
+            "buckets": self._rate_limit.snapshot(),
+        }
+
+    def _total_wait_seconds(self) -> float:
+        return self._throttle_wait_seconds + self._cooldown_wait_seconds + self._backoff_wait_seconds
+
+    def _check_wait_budget(self, *, context: str) -> None:
+        """总等待预算耗尽必须明确失败，而不是继续无限等待或返回部分数据。"""
+        if self._total_wait_seconds() > self._budget.max_total_wait_seconds:
+            raise BudgetExhaustedError(
+                f"{context}: 总等待时间 {self._total_wait_seconds():.1f}s 超过预算 "
+                f"max_total_wait_seconds={self._budget.max_total_wait_seconds}；"
+                "本次扫描未完成，不得按完整数据对待。"
+            )
 
     def get_text(
         self,
@@ -209,6 +272,13 @@ class HttpClient:
             business_check(payload)
         return payload
 
+    def _backoff(self, attempt: int, *, context: str) -> None:
+        """故障退避：第 i 次重试等待 backoff_seconds * (i + 1)，计入总等待预算。"""
+        wait = self._budget.backoff_seconds * (attempt + 1)
+        self._backoff_wait_seconds += wait
+        self._check_wait_budget(context=context)
+        self._sleep(wait)
+
     def _request(
         self,
         *,
@@ -242,6 +312,9 @@ class HttpClient:
                     f"{context}: 请求预算已耗尽（max_requests={self._budget.max_requests}）；"
                     "本次扫描未完成，不得按完整数据对待。"
                 )
+            # 发送前排程：成功请求与重试同样计费；等待也计入总等待预算。
+            self._throttle_wait_seconds += self._rate_limit.before_send(url=url, params=params, context=context)
+            self._check_wait_budget(context=context)
             self._requests_used += 1
             try:
                 response = self._session.get(
@@ -254,21 +327,38 @@ class HttpClient:
                 # 连接/读取类异常可重试；重试耗尽后必须抛错，不能跳过时间段继续。
                 last_error = exc
                 if attempt < self._budget.max_retries:
-                    self._sleep(self._budget.backoff_seconds * (attempt + 1))
+                    self._backoff(attempt, context=context)
                     continue
                 raise HttpStatusError(
                     f"{context}: 网络请求失败且重试耗尽（attempts={attempt + 1}）: {redact_credentials(str(exc))}"
                 ) from exc
 
             status = response.status_code
+            response_headers = response.headers
+            # 响应头校正必须先于状态判定：429 响应同样带已用权重。
+            self._rate_limit.after_response(url=url, headers=response_headers)
+            if status in RATE_LIMITED_STATUS:
+                self._rate_limited_responses += 1
+                # 418 在 penalty 内直接抛 SourceBannedError；429 返回应冷却的秒数。
+                cooldown = self._rate_limit.penalty(url=url, status=status, headers=response_headers, context=context)
+                last_error = HttpStatusError(f"{context}: HTTP 429 限流，冷却 {cooldown:.1f}s")
+                if attempt < self._budget.max_retries:
+                    self._cooldown_wait_seconds += cooldown
+                    self._check_wait_budget(context=context)
+                    self._sleep(cooldown)
+                    continue
+                raise HttpStatusError(
+                    f"{context}: HTTP 429 重试耗尽（attempts={attempt + 1}），"
+                    "按限流处理，不以无限重试绕过。"
+                )
             if status in RETRYABLE_STATUS:
                 last_error = HttpStatusError(f"{context}: 可重试状态 {status}")
                 if attempt < self._budget.max_retries:
-                    self._sleep(self._budget.backoff_seconds * (attempt + 1))
+                    self._backoff(attempt, context=context)
                     continue
                 raise HttpStatusError(
                     f"{context}: HTTP {status} 重试耗尽（attempts={attempt + 1}），"
-                    "按限流/服务端故障处理，不以无限重试绕过。"
+                    "按服务端故障处理，不以无限重试绕过。"
                 )
             if not (200 <= status < 300):
                 # 不可重试的失败（参数错误、鉴权失败、404 等）必须立即暴露。

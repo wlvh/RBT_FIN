@@ -50,6 +50,7 @@ from .errors import (
     RbtFinError,
     ResponseSchemaError,
     RevisionConflictError,
+    SourceBannedError,
     SourceBlockedError,
     StaleCacheError,
     StorageError,
@@ -58,6 +59,7 @@ from .errors import (
 )
 from .exports import ExportRecord, export_trading_csv
 from .http import HttpClient, RequestBudget, build_session
+from .ratelimit import RateLimitConfig, RateLimitRegistry, discover_binance_futures_limit, shared_registry
 from .pipeline import TaskOutcome, acquire_dataset, run_task
 from .registry import build_registry, get_dataset
 from .storage import DatasetStore, Manifest, atomic_write_bytes, exclusive_lock
@@ -81,12 +83,12 @@ __all__ = [
     # 校验（`validate_ohlcv_values` 是不依赖 Dataset/DataRequest 的纯数值合同）
     "validate_ohlcv_values",
     # HTTP
-    "HttpClient", "RequestBudget", "build_session",
+    "HttpClient", "RequestBudget", "build_session", "RateLimitConfig", "RateLimitRegistry", "discover_binance_futures_limit", "shared_registry",
     # 时间
     "complete_end_exclusive", "expected_grid", "require_utc",
     # 异常
     "RbtFinError", "ConfigError", "AcquisitionError", "HttpStatusError",
-    "BusinessStatusError", "ResponseSchemaError", "PaginationError", "BudgetExhaustedError",
+    "BusinessStatusError", "ResponseSchemaError", "PaginationError", "BudgetExhaustedError", "SourceBannedError",
     "ContractError", "TimeContractError", "ValueContractError", "CoverageError",
     "RevisionConflictError", "SourceBlockedError", "StorageError", "LockError", "CacheCorruptionError",
     "PublishError", "PublishedUnverifiedError", "CacheEligibilityError", "OfflineUnavailableError", "StaleCacheError",

@@ -23,17 +23,29 @@ import pandas as pd
 import pytest
 
 from rbt_fin.http import HttpClient, RequestBudget
+from rbt_fin.ratelimit import RateLimitRegistry
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
+# 真实 fapi exchangeInfo.rateLimits 形状（2026-09-19 公开探针抓取值）。
+EXCHANGE_INFO_RATE_LIMITS_PAYLOAD = {"rateLimits": [
+    {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400},
+    {"rateLimitType": "ORDERS", "interval": "MINUTE", "intervalNum": 1, "limit": 1200},
+    {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 300},
+]}
 
 
 class FakeResponse:
     """最小 `requests.Response` 替身：只暴露被测代码真正使用的接口。"""
 
-    def __init__(self, *, status_code: int, payload: Any = None, text: Optional[str] = None) -> None:
+    def __init__(
+        self, *, status_code: int, payload: Any = None, text: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
         self.text = text if text is not None else json.dumps(payload, ensure_ascii=False)
+        # 真实 requests.Response 总有 headers；限速层用它读取 X-MBX-USED-WEIGHT-1M / Retry-After。
+        self.headers: Dict[str, str] = dict(headers or {})
 
     def json(self) -> Any:
         """返回载荷；`text` 非法 JSON 时抛 ValueError，与 requests 行为一致。"""
@@ -53,11 +65,17 @@ class ScriptedSession:
     def __init__(self, handler: Callable[[str, Dict[str, Any]], FakeResponse]) -> None:
         self._handler = handler
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
+        self.exchange_info_calls = 0
         self.headers: Dict[str, str] = {}
 
     def get(self, url: str, params=None, headers=None, timeout=None) -> FakeResponse:
         """模拟 `requests.Session.get`；参数签名必须与真实实现一致。"""
         recorded = dict(params or {})
+        if url.endswith("/fapi/v1/exchangeInfo"):
+            # 0.3.3 起 fapi 适配器在第一次联网取数前读一次实际限额；这里回真实形状的最小 rateLimits 载荷，
+            # 不经 handler，也不计入 `calls`（`calls` 只描述业务端点请求；发现次数单独记录）。
+            self.exchange_info_calls += 1
+            return FakeResponse(status_code=200, payload=EXCHANGE_INFO_RATE_LIMITS_PAYLOAD)
         self.calls.append((url, recorded))
         return self._handler(url, recorded)
 
@@ -84,6 +102,8 @@ def make_client(
         session=session,
         budget=RequestBudget(max_requests=max_requests, max_retries=max_retries, backoff_seconds=0.0),
         sleep=lambda _seconds: None,  # 测试里不真的等待
+        # 每个测试客户端独立的限速账本 + 虚拟时钟：不与进程共享 registry 互相污染，也不真实等待。
+        rate_limit=RateLimitRegistry(clock=lambda: 1_700_000_000.0, sleep=lambda _seconds: None),
     )
     return client, session
 
