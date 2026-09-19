@@ -17,7 +17,9 @@
       同一出口其他程序的请求，本地不能凭自己的计数放松。
     - 429：遵守响应 `Retry-After`（有上限，超过上限即失败）；缺失时保守等到下一窗口起点。
       418：视为封禁状态，立即失败，不再每 1.5s 重试；不换 IP、不换 key、不绕封禁。
-    - 总等待时间由 `RequestBudget.max_total_wait_seconds` 限制，耗尽即失败。
+    - 总等待时间由 `RequestBudget.max_total_wait_seconds` 限制：剩余预算进入排程决策，
+      需要的等待超过剩余预算时立即失败（不安排超预算的等待，也不发送），而不是等完再报错。
+    - 墙钟只定位交易所窗口，单调时钟判定窗口是否真的过去并计算等待；墙钟前拨/回拨不刷新额度。
 
     不能保证的事（如实记录）：Binance 限额按 IP 统计，同一出口的其他进程/程序用量本模块
     看不到，只能通过 `max_share` 余量与响应头反馈降低触发限流的概率；不能把本模块当作
@@ -39,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
-from .errors import ConfigError, HttpStatusError, ResponseSchemaError, SourceBannedError
+from .errors import BudgetExhaustedError, ConfigError, HttpStatusError, ResponseSchemaError, SourceBannedError
 
 # ---------------------------------------------------------------------------
 # 官方限额与权重表（来源写在 source 字段；数值随官方协议变化时必须改这里并重新核对）
@@ -258,6 +260,8 @@ class BucketStats:
     max_header_used: int = 0
     cooldowns: int = 0
     cooldown_wait_seconds: float = 0.0
+    clock_jumps: int = 0
+    budget_refusals: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         """转成可写入 manifest/证据的字典。"""
@@ -270,6 +274,10 @@ class BucketStats:
             "max_header_used": self.max_header_used,
             "cooldowns": self.cooldowns,
             "cooldown_wait_seconds": self.cooldown_wait_seconds,
+            # 墙钟窗口编号变了但单调时间未到期的次数（前拨/回拨），这些跳变没有刷新额度。
+            "clock_jumps": self.clock_jumps,
+            # 因剩余等待预算不足而拒绝安排等待（未发送）的次数。
+            "budget_refusals": self.budget_refusals,
         }
 
 
@@ -277,9 +285,14 @@ class WeightBucket:
     """
     单个限额桶的进程内账本与排程。
 
-    为什么窗口按墙钟对齐：Binance 的计数器按固定的分钟/5 分钟窗口重置（响应头报告的是
-    当前窗口已用量），本地账本必须用同一种窗口才能与响应头对得上；等待时长用同一时钟
-    计算并有界（最多一个窗口 + 边距），墙钟跳变不会造成超长等待。
+    两种时钟各司其职（trading#105 E2E 修订 2）：
+    - 墙钟（`wall_clock`，epoch 秒）只用于**定位**交易所窗口：Binance 的计数器按固定的分钟/5 分钟
+      窗口重置，响应头报告的是当前窗口已用量，本地账本必须用同一种窗口才能与响应头对得上。
+    - 单调时钟（`mono_clock`）用于**判定窗口是否真的过去了**以及计算等待时长：进入一个窗口时把
+      "窗口到期时刻"记成单调时间（`now_mono + 窗口剩余秒数`），只有单调时间到达该时刻才允许重置
+      额度并按当前墙钟重新锚定。墙钟被前拨/回拨（窗口编号变了但单调时间未到期）不刷新额度，
+      只记一次 `clock_jumps`——时钟校正不能在没有实际时间经过的情况下凭空得到一份新额度。
+    - 等待时长按单调到期时刻计算，有界（最多一个窗口 + 边距）。
     """
 
     def __init__(
@@ -287,14 +300,17 @@ class WeightBucket:
         *,
         spec: BucketSpec,
         config: RateLimitConfig,
-        clock: Callable[[], float],
+        wall_clock: Callable[[], float],
+        mono_clock: Callable[[], float],
         sleep: Callable[[float], None],
     ) -> None:
         self.spec = spec
         self._config = config
-        self._clock = clock
+        self._wall_clock = wall_clock
+        self._mono_clock = mono_clock
         self._sleep = sleep
         self._window_id: Optional[int] = None
+        self._window_expires_mono: Optional[float] = None
         self._used = 0
         self.stats = BucketStats()
 
@@ -306,34 +322,66 @@ class WeightBucket:
     @property
     def used_in_window(self) -> int:
         """当前窗口已用权重（本地账本，含响应头上调）。"""
-        self._roll(self._clock())
+        self._roll()
         return self._used
 
-    def _roll(self, now: float) -> None:
-        window_id = int(now // self.spec.interval_seconds)
-        if window_id != self._window_id:
-            self._window_id = window_id
-            self._used = 0
+    @property
+    def window_id(self) -> Optional[int]:
+        """当前锚定的墙钟窗口编号（None 表示尚未使用）。"""
+        return self._window_id
 
-    def seconds_until_next_window(self, now: float) -> float:
-        """到下一窗口起点（含安全边距）的等待秒数，有界于 [margin, interval + margin]。"""
+    def _anchor(self, *, now_wall: float, now_mono: float) -> None:
+        """按当前墙钟锚定窗口，并把窗口到期时刻记成单调时间。"""
         interval = self.spec.interval_seconds
-        wait = (int(now // interval) + 1) * interval - now + self._config.window_margin_seconds
-        return min(max(wait, self._config.window_margin_seconds), interval + self._config.window_margin_seconds)
+        window_id = int(now_wall // interval)
+        remaining = (window_id + 1) * interval - now_wall  # (0, interval]
+        self._window_id = window_id
+        self._window_expires_mono = now_mono + remaining
 
-    def reserve(self, weight: int, *, context: str) -> float:
+    def _roll(self) -> None:
         """
-        在发送前预留权重；本窗口额度不足则等待到下一窗口。
+        窗口推进判定：只有单调时间到达上一次锚定的到期时刻才重置额度。
+
+        为什么不直接比较墙钟窗口编号：墙钟前拨会让编号"看起来"进入了下一窗口，回拨会让编号
+        倒退——两者都不是服务端窗口真的过去了的证据。
+        """
+        now_wall = self._wall_clock()
+        now_mono = self._mono_clock()
+        if self._window_id is None:
+            self._anchor(now_wall=now_wall, now_mono=now_mono)
+            return
+        if now_mono >= self._window_expires_mono:
+            # 单调时间证明当前窗口已结束：重置并按当前墙钟重新锚定（墙钟若被校正，也以校正后为准）。
+            self._used = 0
+            self._anchor(now_wall=now_wall, now_mono=now_mono)
+            return
+        if int(now_wall // self.spec.interval_seconds) != self._window_id:
+            # 墙钟编号变了但单调时间未到期：不刷新额度，只记录跳变。
+            self.stats.clock_jumps += 1
+
+    def seconds_until_next_window(self) -> float:
+        """到当前窗口单调到期时刻（含安全边距）的等待秒数，有界于 [margin, interval + margin]。"""
+        self._roll()
+        margin = self._config.window_margin_seconds
+        wait = self._window_expires_mono - self._mono_clock() + margin
+        return min(max(wait, margin), self.spec.interval_seconds + margin)
+
+    def reserve(self, weight: int, *, context: str, max_wait_seconds: Optional[float] = None) -> float:
+        """
+        在发送前预留权重；本窗口额度不足则等待到下一窗口——但只安排剩余等待预算允许的等待。
 
         Args:
             weight: 本次请求权重。
             context: 报错上下文。
+            max_wait_seconds: 本次调用允许的最大等待秒数（None 表示不限制）。需要的等待超过它时
+                              立即 `BudgetExhaustedError`，既不等待也不发送、不计入请求数。
 
         Returns:
             本次为排程实际等待的秒数（0 表示无需等待）。
 
         Raises:
             ConfigError: 单次权重超过本进程一个窗口的可用额度（永远无法排进去）。
+            BudgetExhaustedError: 需要的等待超过剩余等待预算。
         """
         if weight > self.budget_per_window:
             raise ConfigError(
@@ -342,14 +390,19 @@ class WeightBucket:
             )
         waited = 0.0
         while True:
-            now = self._clock()
-            self._roll(now)
+            self._roll()
             if self._used + weight <= self.budget_per_window:
                 self._used += weight
                 self.stats.requests += 1
                 self.stats.weight_used += weight
                 return waited
-            wait = self.seconds_until_next_window(now)
+            wait = self.seconds_until_next_window()
+            if max_wait_seconds is not None and waited + wait > max_wait_seconds:
+                self.stats.budget_refusals += 1
+                raise BudgetExhaustedError(
+                    f"{context}: 进入下一窗口需等待 {wait:.1f}s，超过剩余等待预算 "
+                    f"{max(max_wait_seconds - waited, 0.0):.1f}s；不安排超预算的等待，也不发送。"
+                )
             self._sleep(wait)
             waited += wait
             self.stats.throttle_waits += 1
@@ -357,7 +410,7 @@ class WeightBucket:
 
     def observe_used(self, used: int) -> None:
         """用响应头报告的本窗口已用权重向上校正本地账本（只上调，不下调）。"""
-        self._roll(self._clock())
+        self._roll()
         if used > self.stats.max_header_used:
             self.stats.max_header_used = used
         if used > self._used:
@@ -407,17 +460,23 @@ class RateLimitRegistry:
         self,
         *,
         config: Optional[RateLimitConfig] = None,
-        clock: Callable[[], float] = time.time,
+        clock: Optional[Callable[[], float]] = None,
+        wall_clock: Optional[Callable[[], float]] = None,
+        mono_clock: Optional[Callable[[], float]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """
         Args:
             config: 排程参数；默认 `RateLimitConfig()`。
-            clock: 返回 epoch 秒的时钟（窗口按其对齐）；测试注入虚拟时钟。
+            wall_clock: 返回 epoch 秒的墙钟，只用于定位交易所窗口；默认 `time.time`。
+            mono_clock: 单调时钟，用于判定窗口是否真的过去与计算等待时长；默认 `time.monotonic`。
+            clock: 兼容参数：只给一个虚拟时钟时同时用作墙钟与单调时钟（测试里 sleep 同步推进两者）。
+                   与 wall_clock/mono_clock 同时给出时以后两者为准。
             sleep: 等待实现；测试注入推进虚拟时钟的实现。
         """
         self._config = config if config is not None else RateLimitConfig()
-        self._clock = clock
+        self._wall_clock = wall_clock if wall_clock is not None else (clock if clock is not None else time.time)
+        self._mono_clock = mono_clock if mono_clock is not None else (clock if clock is not None else time.monotonic)
         self._sleep = sleep
         self._buckets: Dict[str, WeightBucket] = {}
         self._lock = threading.Lock()
@@ -434,7 +493,8 @@ class RateLimitRegistry:
         with self._lock:
             if name not in self._buckets:
                 self._buckets[name] = WeightBucket(
-                    spec=bucket_spec_for(name), config=self._config, clock=self._clock, sleep=self._sleep
+                    spec=bucket_spec_for(name), config=self._config, wall_clock=self._wall_clock,
+                    mono_clock=self._mono_clock, sleep=self._sleep,
                 )
             return self._buckets[name]
 
@@ -463,12 +523,20 @@ class RateLimitRegistry:
         """该桶是否已用运行时来源刷新过限额；返回来源说明或 None。"""
         return self._discovered.get(name)
 
-    def before_send(self, *, url: str, params: Mapping[str, Any], context: str) -> float:
-        """发送前排程；返回为排程等待的秒数。非 Binance host 返回 0。"""
+    def before_send(
+        self, *, url: str, params: Mapping[str, Any], context: str, max_wait_seconds: Optional[float] = None
+    ) -> float:
+        """
+        发送前排程；返回为排程实际等待的秒数。非 Binance host 返回 0。
+
+        Args:
+            max_wait_seconds: 调用方剩余的等待预算；需要的等待超过它时立即 `BudgetExhaustedError`
+                              （不等待、不发送）。None 表示不限制。
+        """
         cost = classify_request(url, params)
         if cost is None:
             return 0.0
-        return self.bucket(cost.bucket).reserve(cost.weight, context=context)
+        return self.bucket(cost.bucket).reserve(cost.weight, context=context, max_wait_seconds=max_wait_seconds)
 
     def after_response(self, *, url: str, headers: Mapping[str, Any]) -> None:
         """用响应头校正账本；没有对应头或桶无响应头反馈时不做任何事。"""
@@ -515,13 +583,19 @@ class RateLimitRegistry:
                 )
             cooldown = max(retry_after, self._config.window_margin_seconds)
         else:
-            interval = bucket.spec.interval_seconds if bucket is not None else 60
-            now = self._clock()
-            cooldown = (int(now // interval) + 1) * interval - now + self._config.window_margin_seconds
-            cooldown = min(max(cooldown, self._config.window_margin_seconds), interval + self._config.window_margin_seconds)
-        if bucket is not None:
-            bucket.record_cooldown(cooldown)
+            # 缺失 Retry-After：保守等到当前窗口的单调到期时刻（有界）。
+            if bucket is not None:
+                cooldown = bucket.seconds_until_next_window()
+            else:
+                cooldown = 60 + self._config.window_margin_seconds
+        # 只计算，不记账：是否真的等待由调用方按剩余预算决定，等过之后再 `record_cooldown()`。
         return cooldown
+
+    def record_cooldown(self, *, url: str, seconds: float) -> None:
+        """记录一次**实际发生**的冷却等待（调用方在 sleep 之后调用，统计如实）。"""
+        cost = classify_request(url, {})
+        if cost is not None:
+            self.bucket(cost.bucket).record_cooldown(seconds)
 
     def snapshot(self) -> Dict[str, Any]:
         """全部桶的规格与统计（证据归档用）。"""
@@ -579,7 +653,7 @@ def discover_binance_futures_limit(http, *, registry: Optional[RateLimitRegistry
             limit = item.get("limit")
             if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
                 raise ResponseSchemaError(f"exchangeInfo REQUEST_WEIGHT limit 非法: {limit!r}")
-            source = f"exchangeInfo@{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(target._clock()))}"
+            source = f"exchangeInfo@{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(target._wall_clock()))}"
             spec = target.update_limit(name=FUTURES_REQUEST_WEIGHT_BUCKET.name, limit=limit, source=source)
             return {"limit": spec.limit, "interval_seconds": spec.interval_seconds, "source": spec.source}
     raise ResponseSchemaError("exchangeInfo.rateLimits 中没有 REQUEST_WEIGHT/MINUTE/1 条目。")

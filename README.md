@@ -18,7 +18,7 @@
 ## 安装
 
 ```bash
-pip install rbt_fin-0.3.3-py3-none-any.whl
+pip install rbt_fin-0.3.4-py3-none-any.whl
 ```
 
 基础依赖只有 `pandas>=2.0`、`numpy` 与 `requests`；包内没有任何来源需要可选依赖（原 `yfinance` 声明已删除，该来源按 #5 §1 不接入）。
@@ -94,7 +94,8 @@ rbt-fin export-trading-csv --cache-root <dir> --dataset btcusdt_perp_1m \
 - 本进程每个窗口只用限额的 `RateLimitConfig.max_share`（默认 0.5，与旧实现每页 `sleep 0.3s` 的节奏量级相当），额度耗尽等到下一分钟窗口；成功请求与重试同样计费；`X-MBX-USED-WEIGHT-1M` 只向上校正本地账本。
 - `discover_binance_futures_limit(http)` 读取真实 `exchangeInfo.rateLimits` 刷新限额（1 权重）；文档示例值不是永久配置。
 - HTTP 429：遵守 `Retry-After`（超过 `cooldown_max_seconds=180` 即失败），缺失时保守等到下一窗口；HTTP 418：`SourceBannedError` 立即失败，不重试、不换出口。
-- `RequestBudget.max_total_wait_seconds`（默认 3600）限制排程 + 冷却 + 退避的总等待；耗尽 `BudgetExhaustedError`，不返回部分数据。
+- `RequestBudget.max_total_wait_seconds`（默认 3600）限制排程 + 冷却 + 退避的总等待：剩余预算进入排程决策，需要的等待超过剩余预算时**立即** `BudgetExhaustedError`（不安排超预算的等待、不发送、不计请求数），耗尽状态对后续调用同样生效；不返回部分数据。
+- 墙钟只用于定位交易所窗口；窗口是否真的过去与等待时长由单调时钟判定，墙钟前拨/回拨不刷新额度（只记 `clock_jumps`）。
 - 默认 K 线单页 `limit=1000`：每权重取得 200 根（1500 档 150 根、499 档 249.5 根）；`limit` 不参与缓存身份。
 - `HttpClient.stats` 把请求数、三类等待秒数、限流响应数与各桶账本分开报告，并写入 manifest `extra.http_stats`。
 - 不能保证：限额按 IP 统计，同一出口其他进程/程序的用量本库看不到；本库不是跨进程/跨机分布式限流器。

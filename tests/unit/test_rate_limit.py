@@ -40,22 +40,41 @@ WINDOW_START = 1_700_000_020.0  # 任意 epoch 秒；1_700_000_000 % 60 == 20，
 
 
 class VirtualClock:
-    """虚拟时钟：sleep 只推进时间并记录，不真的等待。"""
+    """
+    虚拟时钟：墙钟（epoch 秒，只定位窗口）与单调钟（只计经过时间）分开控制；
+    sleep 默认同步推进两者并记录，不真的等待。测试可单独拨动墙钟（`jump_wall`）或只推进单调钟（`advance_mono`）。
+    """
 
     def __init__(self, start: float = WINDOW_START) -> None:
-        self.now = start
+        self.wall = start
+        self.mono = 1000.0
         self.sleeps: list = []
 
-    def clock(self) -> float:
-        return self.now
+    def clock(self) -> float:  # 兼容旧用例：同一虚拟时钟
+        return self.wall
+
+    def wall_clock(self) -> float:
+        return self.wall
+
+    def mono_clock(self) -> float:
+        return self.mono
 
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
-        self.now += seconds
+        self.wall += seconds
+        self.mono += seconds
+
+    def jump_wall(self, seconds: float) -> None:
+        """只校正墙钟（前拨为正、回拨为负），单调时间不变。"""
+        self.wall += seconds
+
+    def advance_mono(self, seconds: float) -> None:
+        """只推进单调时间（墙钟被冻结/回拨的情形）。"""
+        self.mono += seconds
 
 
 def _registry(clock: VirtualClock, **config) -> RateLimitRegistry:
-    return RateLimitRegistry(config=RateLimitConfig(**config), clock=clock.clock, sleep=clock.sleep)
+    return RateLimitRegistry(config=RateLimitConfig(**config), wall_clock=clock.wall_clock, mono_clock=clock.mono_clock, sleep=clock.sleep)
 
 
 def _client(handler, registry, *, max_requests=10_000, max_retries=0, max_total_wait=3600.0):
@@ -280,8 +299,9 @@ def test_total_wait_budget_exhaustion_fails_instead_of_waiting_forever():
     client, _ = _client(lambda u, p: _ok(), registry, max_total_wait=10.0)
     for _ in range(240):
         client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
-    with pytest.raises(BudgetExhaustedError, match="总等待时间"):
+    with pytest.raises(BudgetExhaustedError, match="超过剩余等待预算"):
         client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == []  # 预算不足：不安排等待
 
 
 def test_single_request_weight_above_window_budget_is_rejected():
@@ -356,3 +376,135 @@ def test_pagination_result_is_identical_with_and_without_throttling():
     assert loose_sleeps == [] and len(tight_sleeps) == 1
     assert loose_complete and tight_complete
     pd.testing.assert_frame_equal(loose_frame, tight_frame)
+
+
+# ---------------------------------------------------------------------------
+# 修订 2：等待预算先于排程；墙钟窗口定位与单调等待分离
+# ---------------------------------------------------------------------------
+
+
+def _exhaust_window(client):
+    """用完本窗口 1200 权重（240 次 limit=1000），不产生等待。"""
+    for _ in range(240):
+        client.get_json(url=KLINES_URL, params={"limit": 1000}, context="fill")
+
+
+def test_wait_budget_is_checked_before_scheduling_the_wait():
+    """剩余预算 10s 而进入下一窗口需 20.25s：立即失败，不等待、不发送、不计请求数。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    client, session = _client(lambda u, p: _ok(), registry, max_total_wait=10.0)
+    _exhaust_window(client)
+    with pytest.raises(BudgetExhaustedError, match="不安排超预算的等待"):
+        client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [] and len(session.calls) == 240 and client.requests_used == 240
+    bucket = client.stats["buckets"][FUTURES_REQUEST_WEIGHT_BUCKET.name]
+    assert bucket["requests"] == 240 and bucket["budget_refusals"] == 1 and bucket["throttle_waits"] == 0
+
+
+def test_wait_budget_sufficient_waits_and_sends():
+    """剩余预算 25s：正常等待 20.25s 后发送（对照）。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    client, session = _client(lambda u, p: _ok(), registry, max_total_wait=25.0)
+    _exhaust_window(client)
+    client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [pytest.approx(20.25)] and len(session.calls) == 241
+    assert client.stats["throttle_wait_seconds"] == pytest.approx(20.25)
+
+
+def test_budget_covers_throttle_cooldown_and_backoff_and_stays_exhausted():
+    """同一份预算覆盖排程/冷却/退避；耗尽后后续调用不能绕过。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    # 冷却：预算 5s，429 要求 7s → 不等待、失败；后续调用同样失败
+    responses = iter([FakeResponse(status_code=429, payload={}, headers={"Retry-After": "7"}), _ok(), _ok()])
+    client, session = _client(lambda u, p: next(responses), registry, max_retries=2, max_total_wait=5.0)
+    with pytest.raises(BudgetExhaustedError, match="429 冷却"):
+        client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [] and len(session.calls) == 1
+    assert client.stats["buckets"][FUTURES_REQUEST_WEIGHT_BUCKET.name]["cooldowns"] == 0  # 未发生的冷却不记账
+    # 退避：预算 1s，503 后退避 1.5s → 不等待、失败
+    clock2 = VirtualClock()
+    registry2 = _registry(clock2)
+    responses2 = iter([FakeResponse(status_code=503, payload={}), _ok()])
+    client2, session2 = _client(lambda u, p: next(responses2), registry2, max_retries=1, max_total_wait=1.0)
+    with pytest.raises(BudgetExhaustedError, match="故障退避"):
+        client2.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock2.sleeps == [] and len(session2.calls) == 1
+    # 累计耗尽：预算 25s，等待 20.25s 后再次需要等待 → 立即失败，且再次调用仍失败
+    clock3 = VirtualClock()
+    registry3 = _registry(clock3, max_share=0.5, window_margin_seconds=0.25)
+    client3, session3 = _client(lambda u, p: _ok(), registry3, max_total_wait=25.0)
+    _exhaust_window(client3)
+    client3.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")  # 等 20.25s，新窗口已用 5
+    for _ in range(239):  # 新窗口再用满 1200（不等待）
+        client3.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    for _ in range(2):  # 剩余预算 4.75s < 60.25s：两次都立即失败，不能绕过耗尽状态
+        with pytest.raises(BudgetExhaustedError):
+            client3.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock3.sleeps == [pytest.approx(20.25)] and len(session3.calls) == 480
+
+
+def test_normal_window_rollover_requires_monotonic_elapse():
+    """正常跨窗口：sleep 同步推进墙钟与单调钟，到期后额度重置。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    client, _ = _client(lambda u, p: _ok(), registry)
+    _exhaust_window(client)
+    client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [pytest.approx(20.25)]
+    assert registry.bucket(FUTURES_REQUEST_WEIGHT_BUCKET.name).used_in_window == 5
+
+
+@pytest.mark.parametrize("jump_seconds", [60.0, -60.0, 3600.0, -3600.0])
+def test_wall_clock_jump_without_monotonic_elapse_does_not_refresh_budget(jump_seconds):
+    """墙钟前拨/回拨但单调时间未经过：额度不重置，下一次请求仍按单调到期时刻等待。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    client, session = _client(lambda u, p: _ok(), registry)
+    _exhaust_window(client)
+    clock.jump_wall(jump_seconds)
+    bucket = registry.bucket(FUTURES_REQUEST_WEIGHT_BUCKET.name)
+    assert bucket.used_in_window == 1200  # 跳变没有刷新额度
+    client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [pytest.approx(20.25)]  # 仍按单调到期时刻等待
+    assert len(session.calls) == 241
+    assert client.stats["buckets"][FUTURES_REQUEST_WEIGHT_BUCKET.name]["clock_jumps"] >= 1
+
+
+def test_monotonic_elapse_with_frozen_wall_clock_still_rolls_window():
+    """单调时间已过期而墙钟未变（墙钟被冻结/回拨到同一窗口）：按经过时间重置额度，不额外等待。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+    client, session = _client(lambda u, p: _ok(), registry)
+    _exhaust_window(client)
+    clock.advance_mono(60.0)  # 只推进单调时间
+    client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [] and len(session.calls) == 241
+    assert registry.bucket(FUTURES_REQUEST_WEIGHT_BUCKET.name).used_in_window == 5
+
+
+def test_clock_correction_during_wait_does_not_shorten_or_duplicate_budget():
+    """等待期间墙钟被校正：等待仍按单调到期时刻结束；校正后按新墙钟重新锚定，额度只重置一次。"""
+    clock = VirtualClock()
+    registry = _registry(clock, max_share=0.5, window_margin_seconds=0.25)
+
+    def sleep_with_correction(seconds):
+        clock.sleeps.append(seconds)
+        clock.mono += seconds
+        clock.wall += seconds - 45.0  # 等待期间墙钟被回拨 45s
+
+    registry._sleep = sleep_with_correction
+    registry.bucket(FUTURES_REQUEST_WEIGHT_BUCKET.name)._sleep = sleep_with_correction
+    client, session = _client(lambda u, p: _ok(), registry)
+    _exhaust_window(client)
+    client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert clock.sleeps == [pytest.approx(20.25)] and len(session.calls) == 241
+    bucket = registry.bucket(FUTURES_REQUEST_WEIGHT_BUCKET.name)
+    assert bucket.used_in_window == 5
+    # 校正后的墙钟落在更早的窗口编号；额度已按经过时间重置一次，不会因编号变化再次重置：
+    # 再发 239 次（1195）正好用满 1200 且无需等待
+    for _ in range(239):
+        client.get_json(url=KLINES_URL, params={"limit": 1000}, context="t")
+    assert bucket.used_in_window == 1200 and len(clock.sleeps) == 1

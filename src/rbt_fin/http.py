@@ -60,8 +60,9 @@ class RequestBudget:
         connect_timeout: 连接超时秒数。
         read_timeout: 读取超时秒数。
         backoff_seconds: 重试基础退避秒数；第 i 次重试等待 backoff_seconds * (i + 1)。
-        max_total_wait_seconds: 本客户端生命周期内允许的总等待秒数（限速排程 + 冷却 + 退避）；
-                                耗尽即 `BudgetExhaustedError`，不返回部分数据冒充完整。
+        max_total_wait_seconds: 本客户端生命周期内允许的总等待秒数（限速排程 + 冷却 + 退避共用一份）；
+                                需要的等待超过剩余预算时立即 `BudgetExhaustedError`（不安排超预算的等待、
+                                不发送），耗尽状态对后续调用同样生效，不返回部分数据冒充完整。
                                 默认 3600s：按期货 K 线 limit=1000（权重 5）与 max_share=0.5
                                 （每分钟 1200 权重）估算，一次约 280 万根 1m K 线的冷启动需要
                                 ≈ 2790 页 × 5 / 1200 ≈ 11.6 分钟的排程等待，留有余量。
@@ -197,13 +198,23 @@ class HttpClient:
     def _total_wait_seconds(self) -> float:
         return self._throttle_wait_seconds + self._cooldown_wait_seconds + self._backoff_wait_seconds
 
-    def _check_wait_budget(self, *, context: str) -> None:
-        """总等待预算耗尽必须明确失败，而不是继续无限等待或返回部分数据。"""
-        if self._total_wait_seconds() > self._budget.max_total_wait_seconds:
+    def _remaining_wait_seconds(self) -> float:
+        """剩余等待预算（排程 + 冷却 + 退避共用同一份）。"""
+        return self._budget.max_total_wait_seconds - self._total_wait_seconds()
+
+    def _require_wait_within_budget(self, wait: float, *, context: str, kind: str) -> None:
+        """
+        任何等待安排之前都先核对剩余预算：预算不足就立即失败，不安排超预算的等待、不发送。
+
+        为什么在等待之前而不是之后检查：调用方只愿意再等 N 秒时，安排一段 N 秒以上的等待再报超时，
+        等于既浪费了时间又没有遵守预算（trading#105 E2E 修订 2）。
+        """
+        remaining = self._remaining_wait_seconds()
+        if wait > remaining:
             raise BudgetExhaustedError(
-                f"{context}: 总等待时间 {self._total_wait_seconds():.1f}s 超过预算 "
-                f"max_total_wait_seconds={self._budget.max_total_wait_seconds}；"
-                "本次扫描未完成，不得按完整数据对待。"
+                f"{context}: {kind}需等待 {wait:.1f}s，超过剩余等待预算 {max(remaining, 0.0):.1f}s"
+                f"（max_total_wait_seconds={self._budget.max_total_wait_seconds}，已等待 {self._total_wait_seconds():.1f}s）；"
+                "不安排超预算的等待，本次扫描未完成，不得按完整数据对待。"
             )
 
     def get_text(
@@ -273,10 +284,10 @@ class HttpClient:
         return payload
 
     def _backoff(self, attempt: int, *, context: str) -> None:
-        """故障退避：第 i 次重试等待 backoff_seconds * (i + 1)，计入总等待预算。"""
+        """故障退避：第 i 次重试等待 backoff_seconds * (i + 1)；先核对预算再等待。"""
         wait = self._budget.backoff_seconds * (attempt + 1)
+        self._require_wait_within_budget(wait, context=context, kind="故障退避")
         self._backoff_wait_seconds += wait
-        self._check_wait_budget(context=context)
         self._sleep(wait)
 
     def _request(
@@ -312,9 +323,12 @@ class HttpClient:
                     f"{context}: 请求预算已耗尽（max_requests={self._budget.max_requests}）；"
                     "本次扫描未完成，不得按完整数据对待。"
                 )
-            # 发送前排程：成功请求与重试同样计费；等待也计入总等待预算。
-            self._throttle_wait_seconds += self._rate_limit.before_send(url=url, params=params, context=context)
-            self._check_wait_budget(context=context)
+            # 发送前排程：成功请求与重试同样计费；剩余等待预算进入排程决策——
+            # 需要的等待超过剩余预算时限速器立即抛 BudgetExhaustedError（不等待、不发送、不计请求数）；
+            # 已耗尽的状态在后续调用中同样生效（剩余预算 ≤ 0 时任何等待都会被拒绝）。
+            self._throttle_wait_seconds += self._rate_limit.before_send(
+                url=url, params=params, context=context, max_wait_seconds=self._remaining_wait_seconds()
+            )
             self._requests_used += 1
             try:
                 response = self._session.get(
@@ -343,9 +357,10 @@ class HttpClient:
                 cooldown = self._rate_limit.penalty(url=url, status=status, headers=response_headers, context=context)
                 last_error = HttpStatusError(f"{context}: HTTP 429 限流，冷却 {cooldown:.1f}s")
                 if attempt < self._budget.max_retries:
+                    self._require_wait_within_budget(cooldown, context=context, kind="429 冷却")
                     self._cooldown_wait_seconds += cooldown
-                    self._check_wait_budget(context=context)
                     self._sleep(cooldown)
+                    self._rate_limit.record_cooldown(url=url, seconds=cooldown)
                     continue
                 raise HttpStatusError(
                     f"{context}: HTTP 429 重试耗尽（attempts={attempt + 1}），"
