@@ -35,7 +35,7 @@
 - `tests/unit/test_revision_and_local.py`：同主键相同/不同内容、历史缩短、零分母不填零、本地导入、低频非网格。
 - `tests/unit/test_export_trading_csv.py`：legacy CSV 合同与导出文件自身哈希。
 - `tests/unit/test_import_side_effects.py`：导入无副作用、无反向依赖。
-- `tests/unit/test_self_review_findings.py`：执行者自审（2026-09-19）反例与覆盖补测——存储往返精确（`float_precision="round_trip"`）、凭据脱敏、NaN 修订比对、滑动窗口头部历史保留、窄窗口不裁历史、真正修订仍拒绝、提交后失败为 `PublishedUnverifiedError`、兼容入口本地项与 `--limit` 基线语义、同主键 NaN/数值冲突、FRED `.` 计入说明、PIT 拒绝、CryptoCompare 业务错误、真实重叠分页去重、两处资金费率游标不推进、日内 last 乱序拒绝。
+- `tests/unit/test_self_review_findings.py`：执行者自审（2026-09-19）反例与覆盖补测——外部抽查 R12：修订检查覆盖实际发布范围（只请求 1 月 3 日、来源全量响应改 1 月 1 日 → REJECT 拒绝；区间外记录消失 → 拒绝；重叠不变正常发布；ACCEPT_LATEST 记录全部实际修订并保留上一份内容文件、历史删除仍拒绝）；存储往返精确（`float_precision="round_trip"`）、凭据脱敏、NaN 修订比对、滑动窗口头部历史保留、窄窗口不裁历史、真正修订仍拒绝、提交后失败为 `PublishedUnverifiedError`、兼容入口本地项与 `--limit` 基线语义、同主键 NaN/数值冲突、FRED `.` 计入说明、PIT 拒绝、CryptoCompare 业务错误、真实重叠分页去重、两处资金费率游标不推进、日内 last 乱序拒绝。
 - `tests/unit/test_golden_fixture_roundtrip.py`：固定 fixture → 公共流程 → golden CSV 的字节级回路（WP3 交接件）。
 - `tests/integration/test_interrupt_and_concurrency.py` + `child_worker.py`：真实子进程的提交前/提交后 SIGKILL，以及真实双写者无覆盖丢失。
 - `tests/realsource/test_real_http_qualification.py`：真实来源资格验证；默认被 `-m 'not realsource'` 排除，需显式 `pytest -m realsource`。来源因地域限制不可达时 skip 并打印证据，不伪装成通过。
@@ -64,6 +64,7 @@ python -m pytest -m realsource     # 需要真实来源，默认不执行
 7. 不反向依赖 trading / Optuna / 回测引擎。
 8. 凭据只来自显式配置，代码中没有内置备用 key，其值不进入 params / manifest / 日志 / 异常信息（含连接类异常文本中的 URL 查询串）。
 9. 存储层写入（repr 最短文本）与读回（round_trip 解析）互逆：同样的数据 -> 同样的字节 -> 同样的内容哈希。
+10. 修订检查范围 = 实际会被替换的全部缓存内容（不是本次请求区间）：区间外的数值修订按策略拒绝/记录，任何既有记录消失一律拒绝（历史删除不由 `accept_latest` 放行）。
 
 ## 代码规范
 0. What I cannot create, I do not understand.

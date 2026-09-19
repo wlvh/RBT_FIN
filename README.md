@@ -18,7 +18,7 @@
 ## 安装
 
 ```bash
-pip install rbt_fin-0.3.1-py3-none-any.whl
+pip install rbt_fin-0.3.2-py3-none-any.whl
 ```
 
 基础依赖只有 `pandas>=2.0`、`numpy` 与 `requests`；包内没有任何来源需要可选依赖（原 `yfinance` 声明已删除，该来源按 #5 §1 不接入）。

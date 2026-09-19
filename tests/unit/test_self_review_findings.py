@@ -352,3 +352,73 @@ def test_daily_last_by_utc_date_takes_last_and_rejects_unsorted_input():
     assert list(out["funding_rate"]) == [0.2, 0.3]
     with pytest.raises(TimeContractError, match="升序"):
         daily_last_by_utc_date(frame.iloc[[1, 0, 2]], value_columns=("funding_rate",), context="t")
+
+
+# ---------- 外部抽查 R12（2026-09-19）：修订检查范围必须覆盖实际发布范围 ----------
+
+def _blockchain_payload(days, values):
+    return {"values": [{"x": int(d.value // 10**9), "y": float(v)} for d, v in zip(days, values)]}
+
+
+def _cache_three_days(cache_root):
+    """缓存 1 月 1/2/3 日 = 100/200/300（blockchain_hash_rate：全量响应、非滑动窗口、REVISION_REJECT）。"""
+    dataset = get_dataset("blockchain_hash_rate")
+    client, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[:3], [100, 200, 300])), max_requests=5)
+    first = acquire_dataset(dataset=dataset, request=DataRequest(start=DAYS[0], end_exclusive=DAYS[3], require_full_coverage=False),
+                            store_root=cache_root, now_utc=NOW, http=client)
+    assert first.coverage.rows == 3
+    return dataset, first
+
+
+def test_out_of_window_revision_is_rejected_before_publish(cache_root):
+    """只请求 1 月 3 日，来源全量响应把 1 月 1 日从 100 改成 999：REVISION_REJECT 必须拒绝（此前报告 revision_changed_rows=0 后发布整段）。"""
+    dataset, first = _cache_three_days(cache_root)
+    client2, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[:3], [999, 200, 300])), max_requests=5)
+    with pytest.raises(RevisionConflictError, match="内容不同"):
+        acquire_dataset(dataset=dataset, request=DataRequest(start=DAYS[2], end_exclusive=DAYS[3], require_full_coverage=False),
+                        store_root=cache_root, now_utc=NOW + dt.timedelta(days=1), http=client2)
+    store = DatasetStore(root=cache_root, dataset_id=dataset.dataset_id)
+    manifest = store.read_manifest()
+    assert manifest.content_sha256 == first.content_sha256
+    assert store.read_frame(manifest, verify_content=True).loc[DAYS[0], "value"] == 100.0
+
+
+def test_out_of_window_disappearance_is_rejected_before_publish(cache_root):
+    """只请求 1 月 3 日，来源全量响应少了 1 月 1 日：历史删除不由修订策略放行，旧正式数据保持不变。"""
+    dataset, first = _cache_three_days(cache_root)
+    client2, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[1:3], [200, 300])), max_requests=5)
+    with pytest.raises(RevisionConflictError, match="消失"):
+        acquire_dataset(dataset=dataset, request=DataRequest(start=DAYS[2], end_exclusive=DAYS[3], require_full_coverage=False),
+                        store_root=cache_root, now_utc=NOW + dt.timedelta(days=1), http=client2)
+    assert DatasetStore(root=cache_root, dataset_id=dataset.dataset_id).read_manifest().rows == 3
+
+
+def test_unchanged_overlap_with_narrow_request_publishes_normally(cache_root):
+    """正向对照：区间外内容不变、只新增 1 月 4 日 → 正常发布，revision_changed_rows=0。"""
+    dataset, first = _cache_three_days(cache_root)
+    client2, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[:4], [100, 200, 300, 400])), max_requests=5)
+    result = acquire_dataset(dataset=dataset, request=DataRequest(start=DAYS[3], end_exclusive=DAYS[4], require_full_coverage=False),
+                             store_root=cache_root, now_utc=NOW + dt.timedelta(days=1), http=client2)
+    manifest = DatasetStore(root=cache_root, dataset_id=dataset.dataset_id).read_manifest()
+    assert result.refresh_failed is False and manifest.rows == 4 and manifest.extra["revision_changed_rows"] == 0
+
+
+def test_accept_latest_records_every_actual_revision_and_keeps_previous_content(cache_root):
+    """ACCEPT_LATEST：区间外的实际修订也必须计入（1 条、范围 1 月 1 日），并保留上一份内容文件；历史删除仍拒绝。"""
+    import dataclasses
+    from rbt_fin.contracts import REVISION_ACCEPT_LATEST
+    dataset, first = _cache_three_days(cache_root)
+    first_content_file = Path(first.content_path).name
+    accepting = dataclasses.replace(dataset, revision_policy=REVISION_ACCEPT_LATEST)
+    client2, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[:3], [999, 200, 300])), max_requests=5)
+    result = acquire_dataset(dataset=accepting, request=DataRequest(start=DAYS[2], end_exclusive=DAYS[3], require_full_coverage=False),
+                             store_root=cache_root, now_utc=NOW + dt.timedelta(days=1), http=client2)
+    store = DatasetStore(root=cache_root, dataset_id=dataset.dataset_id)
+    manifest = store.read_manifest()
+    assert manifest.extra["revision_changed_rows"] == 1 and any("修订：1 条" in d and DAYS[0].strftime("%Y-%m-%d") in d for d in result.degradations)
+    assert store.read_frame(manifest, verify_content=True).loc[DAYS[0], "value"] == 999.0
+    assert manifest.previous_content_file == first_content_file and (store.dataset_dir / manifest.previous_content_file).exists()
+    client3, _ = make_client(lambda u, p: FakeResponse(status_code=200, payload=_blockchain_payload(DAYS[1:3], [200, 300])), max_requests=5)
+    with pytest.raises(RevisionConflictError, match="消失"):
+        acquire_dataset(dataset=accepting, request=DataRequest(start=DAYS[2], end_exclusive=DAYS[3], require_full_coverage=False),
+                        store_root=cache_root, now_utc=NOW + dt.timedelta(days=2), http=client3)

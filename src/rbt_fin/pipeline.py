@@ -168,48 +168,46 @@ def _evaluate_cache(
 
 
 def _check_revision(
-    *, dataset: Dataset, request: DataRequest, cached: Optional[pd.DataFrame], acquired: pd.DataFrame
+    *, dataset: Dataset, cached: Optional[pd.DataFrame], acquired: pd.DataFrame
 ) -> Tuple[int, str]:
     """
     在发布前比较新旧内容，执行显式的修订/冲突策略。
 
+    检查范围 = **实际会被替换的全部缓存内容**（不是本次请求区间）：发布端保存的是整个 `acquired`，
+    日频来源一次响应可能覆盖整段历史，只比较请求区间会让区间外的修订/删除绕过检查后被发布。
+
     三种情形：
         - 同主键相同内容：无事发生（去重即可）。
-        - 同主键不同内容：`reject` 策略直接失败；`accept_latest` 记录变更数量与范围。
-        - 历史缩短：请求范围内原有的主键在新数据中消失 -> 保留旧正式数据并报错。
+        - 同主键不同内容：`reject` 策略直接失败；`accept_latest` 记录全部实际变更的数量与范围。
+        - 历史消失：任何既有主键在新数据中消失 -> 保留旧正式数据并报错，**与修订策略无关**（接受修订不等于允许删历史；
+          来源滑动窗口的头部缩短由采集器保留缓存头部，不会走到这里）。
 
     Args:
         dataset: 数据集定义（提供 revision_policy）。
-        request: 本次请求，限定比较窗口。
         cached: 旧正式数据；None 表示首次初始化。
-        acquired: 本次采集得到的完整新内容。
+        acquired: 本次采集得到的完整新内容（即将整体发布）。
 
     Returns:
         `(changed_rows, note)`。
 
     Raises:
-        RevisionConflictError: 未经解释的内容冲突或历史缩短。
+        RevisionConflictError: 未经解释的内容冲突或历史消失。
     """
     if cached is None or len(cached) == 0:
         return 0, ""
-    window = (cached.index >= request.start) & (cached.index < request.end_exclusive)
-    old_window = cached[window]
-    if len(old_window) == 0:
-        return 0, ""
-
-    disappeared = old_window.index.difference(acquired.index)
+    disappeared = cached.index.difference(acquired.index)
     if len(disappeared) > 0:
         raise RevisionConflictError(
-            f"{dataset.dataset_id}: 请求范围内有 {len(disappeared)} 条既有记录在新结果中消失"
+            f"{dataset.dataset_id}: {len(disappeared)} 条既有记录在新结果中消失"
             f"（示例: {[str(t) for t in disappeared[:5]]}）。"
-            "旧正式数据保持不变；仅按显式窗口请求或来源证据才允许缩短历史。"
+            "旧正式数据保持不变；历史删除不由修订策略放行，只有来源证据或显式处置才允许缩短历史。"
         )
 
-    common = old_window.index.intersection(acquired.index)
+    common = cached.index.intersection(acquired.index)
     if len(common) == 0:
         return 0, ""
     columns = list(dataset.value_columns)
-    old_values = old_window.loc[common, columns]
+    old_values = cached.loc[common, columns]
     new_values = acquired.loc[common, columns]
     # NaN 是合同允许的"未定义"（首行/零分母的 _pct），两边同为 NaN 不是内容变化；DataFrame.eq 会把它判成不同。
     same = old_values.eq(new_values) | (old_values.isna() & new_values.isna())
@@ -408,9 +406,7 @@ def _refresh_and_publish(
             f"{dataset.dataset_id}: 采集函数必须返回 AcquireResult，实际为 {type(acquired)!r}"
         )
 
-    revision_changed, revision_note = _check_revision(
-        dataset=dataset, request=request, cached=state.frame, acquired=acquired.frame
-    )
+    revision_changed, revision_note = _check_revision(dataset=dataset, cached=state.frame, acquired=acquired.frame)
     coverage = dataset.validate(
         acquired.frame,
         dataset=dataset,
