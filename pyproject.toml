@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbt-fin"
+# 版本只在 `src/rbt_fin/__about__.py` 声明一次：在这里再写一遍会漂移，
+# 而漂移的表现是"源码已经是新版本、构建出来的 wheel 还是旧版本"。
+dynamic = ["version"]
+description = "统一的加密与宏观数据采集层：公共缓存/校验/内容寻址存储流程 + 分钟行情"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "wlvh"}]
+
+# 为什么基础依赖只有三项：
+# - Issue #5 §7 要求“基础依赖保持小；来源可选依赖不阻止安装/使用核心行情能力”。
+# - 分钟行情（WP1 的首批生产承诺）只需要 pandas（>=2.0：DatetimeIndex.as_unit / format="ISO8601" / lineterminator）+ numpy 解析/校验与 requests 取数。
+# - 没有任何来源需要 yfinance：不声明不存在的可选依赖。
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.21.0",
+    "requests>=2.25.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "build>=1.0.0"]
+
+[project.scripts]
+rbt-fin = "rbt_fin.cli:main"
+
+[project.urls]
+Repository = "https://github.com/wlvh/RBT_FIN"
+Issues = "https://github.com/wlvh/RBT_FIN/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 为什么默认排除 realsource：普通离线测试禁止外部网络（Issue #5 §8）。
+# 需要执行真实来源资格验证时显式覆盖：`pytest -m realsource`。
+addopts = "-q -m 'not realsource'"
+markers = [
+    "realsource: 需要真实外部来源的测试；默认离线测试集不执行",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "rbt_fin.__about__.__version__"}

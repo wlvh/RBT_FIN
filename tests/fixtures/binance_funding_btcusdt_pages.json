@@ -1,0 +1,56 @@
+{
+  "_note": "独立构造的 Binance USDM fundingRate 协议 fixture",
+  "symbol": "BTCUSDT",
+  "range": {
+    "start": "2026-01-01T00:00:00Z",
+    "end_exclusive": "2026-01-03T00:00:00Z"
+  },
+  "pages": [
+    {
+      "startTime": 1767225600000,
+      "rows": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767225600000,
+          "fundingRate": "0.00010000",
+          "markPrice": "30000.00000000"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767254400000,
+          "fundingRate": "0.00020000",
+          "markPrice": "30000.00000000"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767283200000,
+          "fundingRate": "0.00030000",
+          "markPrice": "30000.00000000"
+        }
+      ]
+    },
+    {
+      "startTime": 1767283200001,
+      "rows": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767312000000,
+          "fundingRate": "0.00010000",
+          "markPrice": "30000.00000000"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767340800000,
+          "fundingRate": "0.00020000",
+          "markPrice": "30000.00000000"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1767369600000,
+          "fundingRate": "0.00030000",
+          "markPrice": "30000.00000000"
+        }
+      ]
+    }
+  ]
+}

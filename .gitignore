@@ -1,7 +1,12 @@
 .env
-.env
 __pycache__/
 *.pyc
 .DS_Store
 .vscode/
-*.csv
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+datasets_unified_summary.csv
+cache/
