@@ -1,0 +1,6 @@
+# 固定工具版本；每次提交只扫描暂存区，输出中的疑似密钥自动脱敏。
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

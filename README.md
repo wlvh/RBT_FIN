@@ -123,6 +123,29 @@ CRYPTOCOMPARE_API_KEY=... # cryptocompare_btc_chain_pct
 凭据只在真正发请求时合入，**永不进入** `dataset.params`、`manifest.json` 或日志。
 缺配置时对应来源直接 Fail Fast，不会表现成「零缺失」的正常输出。
 
+网络连接失败只保留脱敏后的错误类型和文字；重试耗尽或退避预算拒绝时，不挂接含请求
+URL 的原始异常，避免完整堆栈和 `logging.exception` 再次带出查询串中的 key。
+
+### 提交前检查
+
+每个克隆需要安装一次本地提交钩子；仅提交配置文件不会自动启用检查：
+
+```bash
+python -m pip install -e '.[dev]'
+pre-commit install --install-hooks
+pre-commit run gitleaks              # 手动检查本次暂存的变更
+```
+
+`.pre-commit-config.yaml` 固定 Gitleaks 版本，钩子只扫描暂存区，疑似密钥的输出自动脱敏。
+`.gitleaks.toml` 继承工具内置规则，并补查 `api_key = os.getenv(...) or "固定 key"`
+这类历史上出现过的备用凭据。测试文件也接受扫描，不整体豁免。
+首次安装会下载工具及所需的 Go 环境；它们不属于运行数据采集器所需的依赖。
+
+`.env` 及 `.env.*` 默认不提交；只有无真实凭据的 `.env.example` 可以作为模板。
+忽略规则不会移除已经被 Git 跟踪的文件，也不会让历史中已经暴露的凭据失效。
+维护者应在 GitHub 的 [Code security 设置](https://github.com/wlvh/RBT_FIN/settings/security_analysis)
+保持密钥扫描和推送保护开启；本地钩子与 GitHub 检查共同防止再次提交凭据。
+
 ## 兼容入口
 
 `data_layer_unified_opt.py` 保留 `--out/--limit` 的原有用途与原版 10 列概览输出，但已收敛为**薄包装**：

@@ -1,0 +1,15 @@
+title = "RBT_FIN credential checks"
+
+# 保留内置规则，继续检查 GitHub/OpenAI 等服务的令牌以及私钥。
+[extend]
+useDefault = true
+
+# 旧代码用 os.getenv(...) or "固定 key" 提供备用值；中间表达式可能超过
+# 默认通用规则的匹配范围。只对凭据变量附近的十六进制常量补充检查，
+# 不把测试数据的 SHA-256 校验值当作凭据，也不全局排除测试文件。
+[[rules]]
+id = "rbt-hardcoded-api-key"
+description = "Hardcoded hexadecimal API key, including environment fallbacks"
+regex = '''(?i)\b(?:api[_-]?key|apikey)\b[^\r\n]{0,100}?["']([a-f0-9]{32,128})["']'''
+secretGroup = 1
+keywords = ["api_key", "api-key", "apikey"]
