@@ -23,11 +23,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
-
-import re
 
 import requests
 
@@ -263,7 +262,7 @@ class HttpClient:
 
         Args:
             url: 完整 URL。
-            params: 查询参数；调用方负责保证其中不含凭据明文（凭据走 headers）。
+            params: 查询参数；FRED/Glassnode 的凭据按来源要求在发送时合入，不持久化。
             context: 报错上下文（数据集/端点标识）。
             business_check: 业务状态校验回调；收到已解析载荷，失败时自行抛 BusinessStatusError。
             headers: 本次请求附加头（例如 API key）；不会写入异常信息。
@@ -308,14 +307,13 @@ class HttpClient:
 
         Args:
             url: 完整 URL。
-            params: 查询参数；调用方负责保证其中不含需要保密的凭据。
+            params: 查询参数；可能含来源要求的凭据，失败时只保留脱敏文字。
             context: 报错上下文。
             headers: 附加头；不会写入异常信息。
 
         Returns:
             `requests.Response`（已确认为 2xx）。
         """
-        last_error: Optional[BaseException] = None
         # attempt 0 为首次尝试，其余为重试；总尝试次数 = max_retries + 1。
         for attempt in range(self._budget.max_retries + 1):
             if self._requests_used >= self._budget.max_requests:
@@ -330,6 +328,7 @@ class HttpClient:
                 url=url, params=params, context=context, max_wait_seconds=self._remaining_wait_seconds()
             )
             self._requests_used += 1
+            request_error = None
             try:
                 response = self._session.get(
                     url,
@@ -338,14 +337,18 @@ class HttpClient:
                     timeout=(self._budget.connect_timeout, self._budget.read_timeout),
                 )
             except requests.RequestException as exc:
-                # 连接/读取类异常可重试；重试耗尽后必须抛错，不能跳过时间段继续。
-                last_error = exc
+                # 原始异常可能持有带 key 的 URL 和请求对象，只提取脱敏后的类型与文字。
+                request_error = redact_credentials(text=f"{type(exc).__name__}: {exc}")
+
+            if request_error is not None:
+                # 必须退出 except 再重试或抛错：否则 from exc 或隐式 __context__
+                # 会让完整堆栈、logging.exception（包括退避预算拒绝）重新暴露原始 key。
                 if attempt < self._budget.max_retries:
-                    self._backoff(attempt, context=context)
+                    self._backoff(attempt=attempt, context=context)
                     continue
                 raise HttpStatusError(
-                    f"{context}: 网络请求失败且重试耗尽（attempts={attempt + 1}）: {redact_credentials(str(exc))}"
-                ) from exc
+                    f"{context}: 网络请求失败且重试耗尽（attempts={attempt + 1}）: {request_error}"
+                )
 
             status = response.status_code
             response_headers = response.headers
@@ -355,7 +358,6 @@ class HttpClient:
                 self._rate_limited_responses += 1
                 # 418 在 penalty 内直接抛 SourceBannedError；429 返回应冷却的秒数。
                 cooldown = self._rate_limit.penalty(url=url, status=status, headers=response_headers, context=context)
-                last_error = HttpStatusError(f"{context}: HTTP 429 限流，冷却 {cooldown:.1f}s")
                 if attempt < self._budget.max_retries:
                     self._require_wait_within_budget(cooldown, context=context, kind="429 冷却")
                     self._cooldown_wait_seconds += cooldown
@@ -367,7 +369,6 @@ class HttpClient:
                     "按限流处理，不以无限重试绕过。"
                 )
             if status in RETRYABLE_STATUS:
-                last_error = HttpStatusError(f"{context}: 可重试状态 {status}")
                 if attempt < self._budget.max_retries:
                     self._backoff(attempt, context=context)
                     continue
@@ -383,4 +384,4 @@ class HttpClient:
             return response
 
         # 理论不可达：循环内所有分支要么 return 要么 raise。
-        raise HttpStatusError(f"{context}: 请求未能完成，最后错误: {last_error!r}")
+        raise HttpStatusError(f"{context}: 请求未能完成。")
